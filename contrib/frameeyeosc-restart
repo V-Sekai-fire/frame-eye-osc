@@ -1,0 +1,11 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Restart the frameeyeosc user service and say how it came back: the app behind
+# contrib/frameeyeosc.desktop. Touches only our own unit, never Valve's services.
+systemctl --user restart frameeyeosc
+sleep 4
+state=$(systemctl --user is-active frameeyeosc)
+last=$(journalctl --user -u frameeyeosc -n 1 --no-pager -o cat 2>/dev/null)
+notify-send -a "Frame Eye OSC" -i view-visible "Eye tracking: $state" "$last" 2>/dev/null || true
+echo "frameeyeosc: $state"
+echo "$last"

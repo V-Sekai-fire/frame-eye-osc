@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Frame Eye OSC
+Comment=Restart eye tracking to VRChat (frameeyeosc user service)
+Exec=/home/steamos/.local/bin/frameeyeosc-restart
+Icon=view-visible
+Terminal=false
+Type=Application
+Categories=Utility;

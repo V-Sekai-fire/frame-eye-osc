@@ -41,6 +41,12 @@ lake build frameeyeosc
 To start it on login, install `contrib/frameeyeosc.service` as a systemd user unit (see
 the comments at the top of that file).
 
+To restart it from the headset's app list, install the "Frame Eye OSC" app:
+`install -m755 contrib/frameeyeosc-restart ~/.local/bin/` and
+`install -m644 contrib/frameeyeosc.desktop ~/.local/share/applications/`. It restarts
+only this user service and shows its state and last log line as a notification. To
+launch it from Steam, add it as a non-Steam game (Desktop Mode, Steam → Add a Game).
+
 ## VRChat
 
 - Enable OSC in the VRChat Action Menu (Options → OSC → Enabled).
