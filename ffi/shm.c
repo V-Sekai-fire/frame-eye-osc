@@ -6,6 +6,7 @@
 #include "eye_server_layout.h"
 
 #include <errno.h>
+#include <signal.h>
 #include <linux/futex.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -81,16 +82,38 @@ static lean_obj_res fe_err(const char *fmt, ...) {
 
 static pthread_mutex_t *fe_mutex(void) { return (pthread_mutex_t *)g_shm->metadata_mutex; }
 
+// While we hold Valve's mutex, SIGINT/SIGTERM/SIGHUP/SIGQUIT are held back, so an
+// ordinary kill can only land between critical sections. A process that died holding
+// the lock would leave eyetracking to recover it (EOWNERDEAD), and it may not.
+static sigset_t g_saved;
+
+static void fe_block_signals(void) {
+  sigset_t s;
+  sigemptyset(&s);
+  sigaddset(&s, SIGINT);
+  sigaddset(&s, SIGTERM);
+  sigaddset(&s, SIGHUP);
+  sigaddset(&s, SIGQUIT);
+  pthread_sigmask(SIG_BLOCK, &s, &g_saved);
+}
+
+static void fe_unlock(void) {
+  pthread_mutex_unlock(fe_mutex());
+  pthread_sigmask(SIG_SETMASK, &g_saved, NULL);
+}
+
 static int fe_lock(void) {
+  fe_block_signals();
   int rc = pthread_mutex_lock(fe_mutex());
   if (rc == EOWNERDEAD) {
     int c = pthread_mutex_consistent(fe_mutex());
     if (c != 0) {
-      pthread_mutex_unlock(fe_mutex());
+      fe_unlock();
       return c;
     }
     return 0;
   }
+  if (rc != 0) pthread_sigmask(SIG_SETMASK, &g_saved, NULL);
   return rc;
 }
 
@@ -139,7 +162,7 @@ LEAN_EXPORT lean_obj_res fe_shm_next(uint32_t timeout_ms, lean_obj_arg w) {
   if (rc != 0) return fe_err("eye mutex: %s", strerror(rc));
   uint32_t seq = __atomic_load_n(&g_shm->sequence, __ATOMIC_ACQUIRE);
   __atomic_store_n(&g_shm->metadata_requested, 1, __ATOMIC_RELEASE);
-  pthread_mutex_unlock(fe_mutex());
+  fe_unlock();
 
   struct timespec ts = {.tv_sec = timeout_ms / 1000, .tv_nsec = (long)(timeout_ms % 1000) * 1000000L};
   long r = syscall(SYS_futex, &g_shm->sequence, FUTEX_WAIT, seq, &ts, NULL, 0);
@@ -155,7 +178,7 @@ LEAN_EXPORT lean_obj_res fe_shm_next(uint32_t timeout_ms, lean_obj_arg w) {
   } else {
     out = lean_alloc_sarray(1, 0, 0);
   }
-  pthread_mutex_unlock(fe_mutex());
+  fe_unlock();
   return lean_io_result_mk_ok(out);
 }
 
