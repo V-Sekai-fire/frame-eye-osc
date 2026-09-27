@@ -24,7 +24,7 @@ structure Cli where
   vergence : Bool := false                     -- keep per-eye convergence; off = both eyes parallel (never cross-eyed)
   smooth : Float := 0.35                       -- EMA factor per sample for native gaze, 1 = off
   anime : Bool := true                        -- --style anime (default): eyes rebuilt clean from raw values
-  trace : Option String := none                -- append "epoch pitch yaw closed" lines at ~10 Hz
+  trace : Option String := none                -- ring of "epoch pitch yaw closed eyeTime" per sample, rewritten each second
   learnPort : UInt16 := 9001                   -- VRChat's OSC output (--osc=9000:<frame-ip>:9001); 0 = off
 
 def usage : String := "usage: frameeyeosc [--target HOST:PORT] [--prefix FT/] [--no-heuristics] [--no-native] [--native-blink] [--style anime|raw] [--vergence] [--gaze-gain PCT] [--gaze-max DEG] [--smooth PCT] [--learn-port 9001] [--dump] [--gains FILE]
@@ -170,7 +170,9 @@ def main (args : List String) : IO UInt32 := do
     let o ← IO.Process.output { cmd := "date", args := #["+%s%3N"] }
     pure ((o.stdout.trim.toNat?.getD 0).toFloat / 1000.0)
   let mono0 ← IO.monoMsNow
+  let mut traceRing : Array String := #[]
   let mut lastTrace := 0
+  let traceCap := 4096
   openSource cli.source
   log s!"reading {cli.source}"
   let sock ← Ffi.udpOpen 0 0
@@ -262,11 +264,14 @@ def main (args : List String) : IO UInt32 := do
         Ffi.udpSend sock r.ip r.port (Osc.encode gazeMsg)
         if let some f := cli.trace then
           let now ← IO.monoMsNow
-          if now - lastTrace ≥ 100 then
+          let t := wall0 + (now - mono0).toFloat / 1000.0
+          let closedNow := toFloat (clamp01 ((out.left.blink + out.right.blink) / 2))
+          traceRing := traceRing.push s!"{t} {gz[0]!} {gz[1]!} {closedNow} {s.time}"
+          if traceRing.size > traceCap then traceRing := traceRing.extract (traceRing.size - traceCap) traceRing.size
+          if now - lastTrace ≥ 1000 then
             lastTrace := now
-            let t := wall0 + (now - mono0).toFloat / 1000.0
-            let closedNow := toFloat (clamp01 ((out.left.blink + out.right.blink) / 2))
-            IO.FS.withFile f .append fun h => h.putStrLn s!"{t} {gz[0]!} {gz[1]!} {closedNow}"
+            IO.FS.writeFile (f ++ ".tmp") ("\n".intercalate traceRing.toList ++ "\n")
+            IO.FS.rename (f ++ ".tmp") f
         if cli.nativeBlink then
           let b := toFloat (clamp01 ((out.left.blink + out.right.blink) / 2))
           if cli.anime then
