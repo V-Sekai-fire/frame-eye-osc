@@ -167,6 +167,11 @@ def main (args : List String) : IO UInt32 := do
   let mut closedS : Float := 0.0
   let mut animeSt : Anime.State := {}
   let mut shut := false
+  -- idle blink: when the tracker stops publishing, blink on our own instead of staring
+  let mut lastSampleAt ← IO.monoMsNow
+  let mut nextIdleBlink : Nat := 0
+  let mut idleBlinkAt : Nat := 0
+  let mut idleSeed : Nat := 12345
   let tuning : Anime.Tuning := {}
   let mut fPitch : OneEuro := {}
   let mut fYaw : OneEuro := {}
@@ -189,7 +194,7 @@ def main (args : List String) : IO UInt32 := do
   let mut lastSave ← IO.monoMsNow
   let mut lastRefresh ← IO.monoMsNow
   repeat
-    let bytes ← try Ffi.shmNext 1000 catch e => do
+    let bytes ← try Ffi.shmNext 50 catch e => do
       -- eyetracking restarted or its mutex is wedged: drop the mapping and map it again
       log s!"{e}; re-opening"
       Ffi.shmClose
@@ -214,6 +219,7 @@ def main (args : List String) : IO UInt32 := do
     let r ← route.get
     match sample, r with
     | some s, some r =>
+      lastSampleAt ← IO.monoMsNow
       let dtS := if lastT == 0.0 then 0.011 else max 0.0 (min 0.1 (s.time - lastT))
       lastT := s.time
       let (input, out) ←
@@ -306,7 +312,22 @@ def main (args : List String) : IO UInt32 := do
         IO.println s!"t={s.time} open={s.openness} extra={s.extra}\n  calib={repr calib}\n  L={repr out.left}\n  R={repr out.right}"
       n := n + 1
     | none, some r =>
-      if active then
+      let now ← IO.monoMsNow
+      if cli.native && cli.nativeBlink && now - lastSampleAt > 300 then
+        -- no fresh eye data: animated idle blinks every 2.5-6 s (60 ms close, 60 hold, 140 open)
+        if nextIdleBlink == 0 || now ≥ nextIdleBlink then
+          idleSeed := (idleSeed * 1103515245 + 12345) % 2147483648
+          idleBlinkAt := now
+          nextIdleBlink := now + 2500 + idleSeed % 3500
+        let e := now - idleBlinkAt
+        let lvl : Float :=
+          if e < 60 then e.toFloat / 60.0
+          else if e < 120 then 1.0
+          else if e < 260 then let u := (e - 120).toFloat / 140.0; 1.0 - u * (2.0 - u)
+          else 0.0
+        let closedMsg : Osc.Message := ⟨"/tracking/eye/EyesClosedAmount", [.f lvl]⟩
+        Ffi.udpSend sock r.ip r.port (Osc.encode closedMsg)
+      if active && now - lastSampleAt > 1000 then
         for a in r.active do Ffi.udpSend sock r.ip r.port (Osc.encode (oscOf a (.bool false)))
         active := false
     | some s, none =>
