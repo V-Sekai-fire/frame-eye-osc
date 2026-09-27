@@ -25,7 +25,7 @@ structure Cli where
   smooth : Float := 0.35                       -- EMA factor per sample for native gaze, 1 = off
   anime : Bool := true                        -- --style anime (default): eyes rebuilt clean from raw values
   traceCap : Nat := 16384                    -- --trace ring size (~3 min at 90 Hz)
-  trace : Option String := none                -- ring of "epoch pitch yaw closed eyeTime" per sample, rewritten each second
+  trace : Option String := none                -- ring of per-sample lines (sent values, raw openness, blink phase), rewritten each second
   learnPort : UInt16 := 9001                   -- VRChat's OSC output (--osc=9000:<frame-ip>:9001); 0 = off
 
 def usage : String := "usage: frameeyeosc [--target HOST:PORT] [--prefix FT/] [--no-heuristics] [--no-native] [--native-blink] [--style anime|raw] [--vergence] [--gaze-gain PCT] [--gaze-max DEG] [--smooth PCT] [--learn-port 9001] [--dump] [--gains FILE]
@@ -268,7 +268,10 @@ def main (args : List String) : IO UInt32 := do
           let now ← IO.monoMsNow
           let t := wall0 + (now - mono0).toFloat / 1000.0
           let closedNow := toFloat (clamp01 ((out.left.blink + out.right.blink) / 2))
-          traceRing := traceRing.push s!"{t} {gz[0]!} {gz[1]!} {closedNow} {s.time}"
+          let ph (e : Anime.EyeState) : String := match e.phase with
+            | .opened => "O" | .closing => "c" | .closed => "C" | .opening => "o"
+          -- epoch pitch yaw closed eyeTime rawOpenL rawOpenR relL relR phaseL phaseR
+          traceRing := traceRing.push s!"{t} {gz[0]!} {gz[1]!} {closedNow} {s.time} {s.openness[0]!} {s.openness[1]!} {Anime.rel calib.left (ofFloat s.openness[0]!)} {Anime.rel calib.right (ofFloat s.openness[1]!)} {ph animeSt.left}{ph animeSt.right}"
           if traceRing.size > traceCap then traceRing := traceRing.extract (traceRing.size - traceCap) traceRing.size
           if now - lastTrace ≥ 1000 then
             lastTrace := now
