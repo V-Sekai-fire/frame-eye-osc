@@ -17,8 +17,9 @@ structure Cli where
   dump : Bool := false
   gains : System.FilePath := "data/eye_facial_action.json"
   source : String := "/dev/shm/eye-server.mmap"
+  native : Bool := true                        -- VRChat's /tracking/eye/* (any avatar)
 
-def usage : String := "usage: frameeyeosc [--target HOST:PORT] [--prefix FT/] [--no-heuristics] [--dump] [--gains FILE]
+def usage : String := "usage: frameeyeosc [--target HOST:PORT] [--prefix FT/] [--no-heuristics] [--no-native] [--dump] [--gains FILE]
   With no --target, VRChat is found over mDNS/OSCQuery and only the current avatar's
   parameters are sent. With --target, every v2 float is sent to HOST:PORT."
 
@@ -34,6 +35,7 @@ def parseCli : List String → Cli → Except String Cli
     let p := (p.dropWhile (· == '/')).toString
     parseCli rest { c with prefix_ := if p.isEmpty || p.endsWith "/" then p else p ++ "/" }
   | "--no-heuristics" :: rest, c => parseCli rest { c with heuristics := false }
+  | "--no-native" :: rest, c => parseCli rest { c with native := false }
   | "--dump" :: rest, c => parseCli rest { c with dump := true }
   | "--gains" :: f :: rest, c => parseCli rest { c with gains := f }
   | "--source" :: f :: rest, c => parseCli rest { c with source := f }
@@ -124,6 +126,14 @@ def main (args : List String) : IO UInt32 := do
         if refresh || last[e.address]? != some v then
           Ffi.udpSend sock r.ip r.port (Osc.encode (oscOf e.address v))
           last := last.insert e.address v
+      if cli.native then
+        let (lp, ly) := Shm.pitchYawDeg s.gaze[0]!
+        let (rp, ry) := Shm.pitchYawDeg s.gaze[1]!
+        let closed := toFloat (clamp01 ((out.left.blink + out.right.blink) / 2))
+        let gazeMsg : Osc.Message := ⟨"/tracking/eye/LeftRightPitchYaw", [.f lp, .f ly, .f rp, .f ry]⟩
+        let closedMsg : Osc.Message := ⟨"/tracking/eye/EyesClosedAmount", [.f closed]⟩
+        Ffi.udpSend sock r.ip r.port (Osc.encode gazeMsg)
+        Ffi.udpSend sock r.ip r.port (Osc.encode closedMsg)
       if !active || refresh then
         for a in r.active do Ffi.udpSend sock r.ip r.port (Osc.encode (oscOf a (.bool true)))
       active := true

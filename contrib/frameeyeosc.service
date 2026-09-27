@@ -7,7 +7,11 @@ After=graphical-session.target
 
 [Service]
 WorkingDirectory=%h/frameeyeosc
-ExecStart=%h/frameeyeosc/.lake/build/bin/frameeyeosc
+# With no arguments it finds VRChat over mDNS/OSCQuery. VRChat's OSCQuery HTTP server
+# only listens on 127.0.0.1, so for VRChat on a PC pass its address instead, e.g. via
+#   systemctl --user edit frameeyeosc   ->  Environment="FRAMEEYEOSC_ARGS=--target 192.168.1.229:9000"
+Environment=FRAMEEYEOSC_ARGS=
+ExecStart=%h/frameeyeosc/.lake/build/bin/frameeyeosc $FRAMEEYEOSC_ARGS
 Restart=always
 RestartSec=3
 

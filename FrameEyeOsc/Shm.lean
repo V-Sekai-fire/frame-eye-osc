@@ -59,6 +59,14 @@ def gazeAngles (v : Float × Float × Float) : Float × Float :=
   let k := 4.0 / 3.141592653589793
   (Float.atan2 x (-z) * k, Float.atan2 y (-z) * k)
 
+/-- VRChat's native eye tracking, `/tracking/eye/LeftRightPitchYaw`: degrees, Unity
+convention (positive pitch looks down, positive yaw looks right), clamped to ±45°. -/
+def pitchYawDeg (v : Float × Float × Float) : Float × Float :=
+  let (x, y, z) := v
+  let d := 180.0 / 3.141592653589793
+  let c (a : Float) := if a > 45.0 then 45.0 else if a < -45.0 then -45.0 else a
+  (c (-(Float.atan2 y (-z)) * d), c (Float.atan2 x (-z) * d))
+
 def toFrameIn (s : EyeSample) : Expressions.FrameIn :=
   let eyeIn (i : Nat) : Expressions.EyeIn :=
     let (ax, ay) := gazeAngles s.gaze[i]!
