@@ -117,15 +117,34 @@ partial def discoveryLoop (route : IO.Ref (Option Route)) (avatar : Option Strin
   IO.sleep 3000
   discoveryLoop route next
 
-/-- Listen to VRChat's OSC output and keep the avatar's parameter list. -/
-partial def learnLoop (fd : UInt32) (learned : IO.Ref (Learn.State × Nat)) : IO Unit := do
+/-- What the learn listener has heard: the last packet's monotonic time and a packet count,
+for the watchdog and the heartbeat. -/
+structure Heard where
+  lastMs : Nat := 0
+  packets : Nat := 0
+
+/-- Listen to VRChat's OSC output and keep the avatar's parameter list. Exits once `gen`
+moves past `mine`: the watchdog has closed its socket and replaced it. -/
+partial def learnLoop (fd : UInt32) (learned : IO.Ref (Learn.State × Nat)) (heard : IO.Ref Heard)
+    (gen : IO.Ref Nat) (mine : Nat) : IO Unit := do
+  if (← gen.get) != mine then
+    return
   let (pkt, _) ← try Ffi.udpRecv fd 500 catch _ => pure (.empty, "")
   if pkt.size > 0 then
+    let now ← IO.monoMsNow
+    heard.modify fun h => { lastMs := now, packets := h.packets + 1 }
     for m in Osc.decodePacket pkt do
       let (st, n) ← learned.get
       let (st', changed) := Learn.observe st m
       if changed then learned.set (st', n + 1)
-  learnLoop fd learned
+  learnLoop fd learned heard gen mine
+
+/-- Open the learn port and start a listener of generation `mine`; returns its socket. -/
+def startLearn (port : UInt16) (learned : IO.Ref (Learn.State × Nat)) (heard : IO.Ref Heard)
+    (gen : IO.Ref Nat) (mine : Nat) : IO UInt32 := do
+  let fd ← Ffi.udpOpen port 0
+  let _ ← IO.asTask (prio := .dedicated) (learnLoop fd learned heard gen mine)
+  pure fd
 
 /-- The learned plan adds to the fallback v2 floats instead of replacing them: a learned
 list is often partial (VRChat's parameter dump arrives as many UDP datagrams, and some are
@@ -162,10 +181,23 @@ def main (args : List String) : IO UInt32 := do
     let _ ← IO.asTask (prio := .dedicated) (discoveryLoop route none)
     log "looking for VRChat over mDNS/OSCQuery"
   let learned ← IO.mkRef ((default : Learn.State), 0)
-  if cli.target.isSome && cli.learnPort != 0 then
-    let fd ← Ffi.udpOpen cli.learnPort 0
-    let _ ← IO.asTask (prio := .dedicated) (learnLoop fd learned)
+  let heard ← IO.mkRef ({ lastMs := ← IO.monoMsNow } : Heard)
+  let learnGen ← IO.mkRef 0
+  let learning := cli.target.isSome && cli.learnPort != 0
+  let mut learnFd : Option UInt32 := none
+  if learning then
+    learnFd := some (← startLearn cli.learnPort learned heard learnGen 0)
     log s!"learning avatar parameters from VRChat's OSC output on UDP {cli.learnPort}"
+  -- watchdog: VRChat's OSC output is continuous while it runs, so silence on the learn
+  -- port means the listener is stuck (seen after boot, before Wi-Fi) or VRChat is gone.
+  -- Re-open it, backing off 15 s -> 120 s; a packet resets the backoff.
+  let mut reopenAt ← IO.monoMsNow
+  let mut reopenBackoff : Nat := 15000
+  let mut reopens : Nat := 0
+  -- heartbeat: one line every 5 min, so the journal tells the next failure apart
+  let mut beatAt ← IO.monoMsNow
+  let mut beatSamples : Nat := 0
+  let mut beatPackets : Nat := 0
   let mut seenVersion := 0
   let mut changedAt := 0
   let mut gz : Array Float := #[0.0, 0.0, 0.0, 0.0]   -- smoothed native gaze (pitch, yaw, pitch, yaw)
@@ -207,6 +239,35 @@ def main (args : List String) : IO UInt32 := do
       openSource cli.source
       pure .empty
     let sample := (Shm.decode bytes).filter (·.valid)
+    if sample.isSome then
+      beatSamples := beatSamples + 1
+    let nowW ← IO.monoMsNow
+    if learning then
+      let h ← heard.get
+      if nowW - h.lastMs < reopenBackoff then
+        reopenBackoff := 15000
+      else if nowW - reopenAt ≥ reopenBackoff then
+        -- retire the old listener first: bump its generation, close its socket (a
+        -- listener stuck in poll wakes on the closed fd and sees it is stale)
+        let g ← learnGen.modifyGet fun g => (g + 1, g + 1)
+        if let some fd := learnFd then
+          Ffi.udpClose fd
+        learnFd := none
+        reopens := reopens + 1
+        try
+          learnFd := some (← startLearn cli.learnPort learned heard learnGen g)
+          log s!"no VRChat OSC on UDP {cli.learnPort} for {(nowW - h.lastMs) / 1000} s: listener re-opened (#{reopens}); next check in {reopenBackoff / 1000} s"
+        catch e =>
+          log s!"re-opening UDP {cli.learnPort} failed: {e}"
+        reopenAt := nowW
+        reopenBackoff := min 120000 (2 * reopenBackoff)
+    if nowW - beatAt ≥ 300000 then
+      let h ← heard.get
+      let (st, _) ← learned.get
+      log s!"heartbeat: eye {beatSamples * 1000 / (nowW - beatAt)} Hz, VRChat OSC {h.packets - beatPackets} packets (last {(nowW - h.lastMs) / 1000} s ago), {st.list.length} params learned, {reopens} re-opens"
+      beatAt := nowW
+      beatSamples := 0
+      beatPackets := h.packets
     -- adopt a learned parameter list once it has been quiet for 300 ms
     if let some (ip, port) := cli.target then
       let (st, v) ← learned.get
