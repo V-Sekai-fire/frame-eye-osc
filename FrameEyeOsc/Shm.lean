@@ -85,6 +85,12 @@ def expressive (gain limit dead a : Float) : Float :=
     let v := limit * Float.tanh (gain * m / limit)
     if a < 0.0 then -v else v
 
+/-- Eyes-shut evidence: the sum of `estimate_extra[4..7]`. In spoken-cue recordings it
+sits near 0.002 with eyes open and near 0.014 held shut, a ~7× gap (AUC ≈ 0.98), while
+raw left-eye openness does not drop at all during a held closure. -/
+def shutScore (s : EyeSample) : Float :=
+  s.extra[4]! + s.extra[5]! + s.extra[6]! + s.extra[7]!
+
 /-- Smoothstep from `lo` to `hi`: a decisive blink instead of a hovering eyelid. -/
 def snap (lo hi v : Float) : Float :=
   let t := (v - lo) / (hi - lo)

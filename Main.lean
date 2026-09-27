@@ -26,6 +26,7 @@ structure Cli where
   anime : Bool := true                        -- --style anime (default): eyes rebuilt clean from raw values
   traceCap : Nat := 16384                    -- --trace ring size (~3 min at 90 Hz)
   trace : Option String := none                -- ring of per-sample lines (sent values, raw openness, blink phase), rewritten each second
+  closureExtras : Bool := true               -- detect held-shut eyes from estimate_extra[4..7] (--closure openness to disable)
   learnPort : UInt16 := 9001                   -- VRChat's OSC output (--osc=9000:<frame-ip>:9001); 0 = off
 
 def usage : String := "usage: frameeyeosc [--target HOST:PORT] [--prefix FT/] [--no-heuristics] [--no-native] [--native-blink] [--style anime|raw] [--vergence] [--gaze-gain PCT] [--gaze-max DEG] [--smooth PCT] [--learn-port 9001] [--dump] [--gains FILE]
@@ -48,6 +49,8 @@ def parseCli : List String → Cli → Except String Cli
   | "--no-native" :: rest, c => parseCli rest { c with native := false }
   | "--trace-cap" :: n :: rest, c => parseCli rest { c with traceCap := n.toNat?.getD c.traceCap }
   | "--trace" :: f :: rest, c => parseCli rest { c with trace := some f }
+  | "--closure" :: "extras" :: rest, c => parseCli rest { c with closureExtras := true }
+  | "--closure" :: "openness" :: rest, c => parseCli rest { c with closureExtras := false }
   | "--native-blink" :: rest, c => parseCli rest { c with nativeBlink := true }
   | "--style" :: "anime" :: rest, c => parseCli rest { c with anime := true }
   | "--style" :: "raw" :: rest, c => parseCli rest { c with anime := false }
@@ -163,6 +166,7 @@ def main (args : List String) : IO UInt32 := do
   let mut gz : Array Float := #[0.0, 0.0, 0.0, 0.0]   -- smoothed native gaze (pitch, yaw, pitch, yaw)
   let mut closedS : Float := 0.0
   let mut animeSt : Anime.State := {}
+  let mut shut := false
   let tuning : Anime.Tuning := {}
   let mut fPitch : OneEuro := {}
   let mut fYaw : OneEuro := {}
@@ -224,8 +228,13 @@ def main (args : List String) : IO UInt32 := do
           let gy := ofFloat (-(ex fPitch.x) / 45.0)
           let input : FrameIn := { left := { base.left with x := gx, y := gy }, right := { base.right with x := gx, y := gy } }
           calib := Calib.stepFrame calib input
-          animeSt := Anime.step tuning (dtS * 1000.0).toUInt64.toNat animeSt
-            (Anime.rel calib.left input.left.openness) (Anime.rel calib.right input.right.openness)
+          -- held-shut eyes: estimate_extra[4..7] with hysteresis (openness alone reopens mid-closure)
+          if cli.closureExtras then
+            let sc := Shm.shutScore s
+            shut := if shut then sc > 0.004 else sc > 0.008
+          let (rl, rr) := if shut then (0, 0)
+            else (Anime.rel calib.left input.left.openness, Anime.rel calib.right input.right.openness)
+          animeSt := Anime.step tuning (dtS * 1000.0).toUInt64.toNat animeSt rl rr
           let out := Anime.styleFrame tuning gains cli.heuristics calib input animeSt (frame gains cli.heuristics calib input)
           pure (input, out)
         else do
@@ -271,7 +280,7 @@ def main (args : List String) : IO UInt32 := do
           let ph (e : Anime.EyeState) : String := match e.phase with
             | .opened => "O" | .closing => "c" | .closed => "C" | .opening => "o"
           -- epoch pitch yaw closed eyeTime rawOpenL rawOpenR relL relR phaseL phaseR
-          traceRing := traceRing.push s!"{t} {gz[0]!} {gz[1]!} {closedNow} {s.time} {s.openness[0]!} {s.openness[1]!} {Anime.rel calib.left (ofFloat s.openness[0]!)} {Anime.rel calib.right (ofFloat s.openness[1]!)} {ph animeSt.left}{ph animeSt.right}"
+          traceRing := traceRing.push s!"{t} {gz[0]!} {gz[1]!} {closedNow} {s.time} {s.openness[0]!} {s.openness[1]!} {Anime.rel calib.left (ofFloat s.openness[0]!)} {Anime.rel calib.right (ofFloat s.openness[1]!)} {ph animeSt.left}{ph animeSt.right} {Shm.shutScore s} {if shut then 1 else 0}"
           if traceRing.size > traceCap then traceRing := traceRing.extract (traceRing.size - traceCap) traceRing.size
           if now - lastTrace ≥ 1000 then
             lastTrace := now
