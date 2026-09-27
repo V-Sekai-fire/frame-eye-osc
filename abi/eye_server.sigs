@@ -1,0 +1,56 @@
+# The calls frameeyeosc makes against the Steam Frame eye server.
+#
+# The eye server is not a library. It is a shared-memory object that SteamVR's
+# `eyetracking` process (/opt/steamvr/tools/eyetracking/bin/linuxarm64/eyetracking)
+# publishes and `vrserver` maps. It has no exported symbols, so this file lists every
+# libc call the reader makes against that object, one C declaration per line.
+#
+# How it is used. It does NOT go through generate_stubs.py. A dlsym table over libc
+# would define `mmap`, `open` and so on in our own object, which would interpose on
+# them for the whole process, including the Lean runtime. Instead sigs_to_header.py
+# turns it into prototypes that are compiled next to the real glibc headers in
+# ffi/shm.c. A signature here that disagrees with glibc's is a "conflicting types"
+# compile error, so the build checks this file against the libc it links.
+#
+# The protocol. Reverse-engineered by konsti219 (github.com/konsti219/frameeyeosc,
+# MIT) against Frame firmware 0.5.0, and re-verified on the fire-s-frame dev kit on
+# 2026-09-26 (SteamOS holo, kernel 6.18.0, glibc 2.39, aarch64):
+#
+#   path     /dev/shm/eye-server.mmap, mode 0666, owned by the session user
+#   size     0x4F21A bytes (324122). Mapped whole, read-write, MAP_SHARED.
+#   version  u32 at 0x00 must be 4. Any other value is a different ABI. Refuse it.
+#   ready    u32 at 0x04 must be 1.
+#   mutex    a process-shared, robust glibc pthread_mutex_t at 0x08, 0x30 bytes wide.
+#   sequence u32 at 0x38, the futex word the server bumps per published sample.
+#   request  u32 at 0x3c, metadata_requested. The server publishes only while it is 1.
+#   record   the packed EyeDataMmap at 0x152, 0xebc bytes.
+#
+#   One read:
+#     lock(mutex)             EOWNERDEAD -> pthread_mutex_consistent, then carry on
+#     s = sequence; request = 1
+#     unlock(mutex)
+#     futex(&sequence, FUTEX_WAIT, s, timeout)   EAGAIN, EINTR, ETIMEDOUT are not errors
+#     lock(mutex)
+#     if sequence != s: copy the record
+#     unlock(mutex)
+#   The copy is valid only when the record's producer_state (u32 at +0x00) is 1.
+#
+# Where the pattern stops short, as it does for nvenc.sigs: a .sigs file cannot say
+# where the fields sit. The record layout lives in FrameEyeOsc/Layout.lean, where its
+# non-overlap and bounds are proved. abi/eye_server_layout.h is generated from that
+# table (lake exe layout_header), and ffi/shm.c checks it with _Static_assert.
+
+# Map the object
+int open(const char *pathname, int flags, ...);
+int fstat(int fd, struct stat *statbuf);
+void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset);
+int munmap(void *addr, size_t length);
+int close(int fd);
+
+# The metadata mutex, shared and robust
+int pthread_mutex_lock(pthread_mutex_t *mutex);
+int pthread_mutex_unlock(pthread_mutex_t *mutex);
+int pthread_mutex_consistent(pthread_mutex_t *mutex);
+
+# FUTEX_WAIT on the sequence word. glibc has no futex() wrapper.
+long syscall(long number, ...);
