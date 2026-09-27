@@ -21,11 +21,11 @@ structure Cli where
   nativeBlink : Bool := false                  -- /tracking/eye/EyesClosedAmount; stops VRChat's auto-blink
   gazeGain : Float := 0.7                      -- native gaze scale (anime eyes look wrong at 1:1)
   gazeMax : Float := 25.0                      -- native gaze clamp, degrees
-  perEye : Bool := false                       -- send per-eye vergence (LeftRightPitchYaw) instead of one center gaze
+  vergence : Bool := false                     -- keep per-eye convergence; off = both eyes parallel (never cross-eyed)
   smooth : Float := 0.35                       -- EMA factor per sample for native gaze, 1 = off
   learnPort : UInt16 := 9001                   -- VRChat's OSC output (--osc=9000:<frame-ip>:9001); 0 = off
 
-def usage : String := "usage: frameeyeosc [--target HOST:PORT] [--prefix FT/] [--no-heuristics] [--no-native] [--native-blink] [--per-eye] [--gaze-gain PCT] [--gaze-max DEG] [--smooth PCT] [--learn-port 9001] [--dump] [--gains FILE]
+def usage : String := "usage: frameeyeosc [--target HOST:PORT] [--prefix FT/] [--no-heuristics] [--no-native] [--native-blink] [--vergence] [--gaze-gain PCT] [--gaze-max DEG] [--smooth PCT] [--learn-port 9001] [--dump] [--gains FILE]
   With no --target, VRChat is found over mDNS/OSCQuery and only the current avatar's
   parameters are sent. With --target, parameters are learned from VRChat's OSC output
   (launch VRChat with --osc=9000:<frame-ip>:9001); until then every v2 float is sent."
@@ -44,7 +44,8 @@ def parseCli : List String → Cli → Except String Cli
   | "--no-heuristics" :: rest, c => parseCli rest { c with heuristics := false }
   | "--no-native" :: rest, c => parseCli rest { c with native := false }
   | "--native-blink" :: rest, c => parseCli rest { c with nativeBlink := true }
-  | "--per-eye" :: rest, c => parseCli rest { c with perEye := true }
+  | "--vergence" :: rest, c => parseCli rest { c with vergence := true }
+  | "--per-eye" :: rest, c => parseCli rest { c with vergence := true }
   | "--gaze-gain" :: v :: rest, c => parseCli rest { c with gazeGain := (v.toNat?.map (·.toFloat / 100.0)).getD c.gazeGain }
   | "--gaze-max" :: v :: rest, c => parseCli rest { c with gazeMax := (v.toNat?.map (·.toFloat)).getD c.gazeMax }
   | "--smooth" :: v :: rest, c => parseCli rest { c with smooth := (v.toNat?.map (·.toFloat / 100.0)).getD c.smooth }
@@ -166,7 +167,7 @@ def main (args : List String) : IO UInt32 := do
     let r ← route.get
     match sample, r with
     | some s, some r =>
-      let input := Shm.toFrameIn s
+      let input := if cli.vergence then Shm.toFrameIn s else (Shm.toFrameIn s).parallel
       calib := Calib.stepFrame calib input
       let out := frame gains cli.heuristics calib input
       let now ← IO.monoMsNow
@@ -183,7 +184,7 @@ def main (args : List String) : IO UInt32 := do
           let a := a * cli.gazeGain
           if a > cli.gazeMax then cli.gazeMax else if a < -cli.gazeMax then -cli.gazeMax else a
         let raw : Array Float :=
-          if cli.perEye then
+          if cli.vergence then
             let (lp, ly) := Shm.pitchYawDeg s.gaze[0]!
             let (rp, ry) := Shm.pitchYawDeg s.gaze[1]!
             #[shape lp, shape ly, shape rp, shape ry]
@@ -192,7 +193,7 @@ def main (args : List String) : IO UInt32 := do
             #[shape p, shape y, shape p, shape y]
         gz := (gz.zip raw).map fun (o, n) => o + cli.smooth * (n - o)
         let gazeMsg : Osc.Message :=
-          if cli.perEye then ⟨"/tracking/eye/LeftRightPitchYaw", gz.toList.map Osc.Arg.f⟩
+          if cli.vergence then ⟨"/tracking/eye/LeftRightPitchYaw", gz.toList.map Osc.Arg.f⟩
           else ⟨"/tracking/eye/CenterPitchYaw", [.f gz[0]!, .f gz[1]!]⟩
         Ffi.udpSend sock r.ip r.port (Osc.encode gazeMsg)
         if cli.nativeBlink then

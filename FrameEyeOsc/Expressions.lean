@@ -219,4 +219,24 @@ theorem frame_mirror (g : Gains) (h : Bool) (c : FrameCalib) (f : FrameIn) :
   · rw [mid_comm, ← mid_neg]
   · rw [mid_comm]
 
+-- ── Parallel gaze: never cross-eyed ──────────────────────────────────────────
+
+/-- Give both eyes the combined gaze, dropping vergence. Stylised avatars with large
+eyes look cross-eyed when each eye converges on a near point, as real eyes do. -/
+def FrameIn.parallel (f : FrameIn) : FrameIn :=
+  let x := mid f.left.x f.right.x
+  let y := mid f.left.y f.right.y
+  { left := { f.left with x, y }, right := { f.right with x, y } }
+
+/-- With `parallel`, both eyes always report the same gaze: never crossed, never walled. -/
+theorem parallel_uncrossed (g : Gains) (h : Bool) (c : FrameCalib) (f : FrameIn) :
+    (frame g h c f.parallel).left.x = (frame g h c f.parallel).right.x ∧
+    (frame g h c f.parallel).left.y = (frame g h c f.parallel).right.y := by
+  simp [frame, eye, FrameIn.parallel]
+
+/-- `parallel` keeps the mirror symmetry of the whole mapping. -/
+theorem parallel_mirror (f : FrameIn) : f.mirror.parallel = f.parallel.mirror := by
+  simp only [FrameIn.parallel, FrameIn.mirror]
+  rw [mid_comm (-f.right.x), mid_neg, mid_comm f.right.y]
+
 end FrameEyeOsc.Expressions

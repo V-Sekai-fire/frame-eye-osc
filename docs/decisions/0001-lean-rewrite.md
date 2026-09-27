@@ -17,6 +17,7 @@ does not need to run anywhere.
 | every weight in [0,1], every axis in [-1,1], for any input, calibration or gains | theorem | `Expressions.eye_valid` |
 | blink and wide never both nonzero | theorem | `Expressions.blink_wide_exclusive` |
 | mirroring the face mirrors every output | theorem | `Expressions.frame_mirror` |
+| parallel mode: both eyes always report the same gaze, and it commutes with mirroring | theorems | `Expressions.parallel_uncrossed`, `parallel_mirror` |
 | binary level fits its bits; truncation error under one step; bits round-trip (1–6 bits) | theorems | `Params.level_lt`, `level_error`, `bits_roundtrip_*` |
 | OSC packets are whole 32-bit words | theorem | `Osc.encode_len_mod4` |
 | OSC decode ∘ encode, shm decode, `ofFloat`, DNS, parameter matching | plausible properties | `Proptest.lean` |

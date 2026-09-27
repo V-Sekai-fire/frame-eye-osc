@@ -20,7 +20,7 @@ From eyelid co-activation heuristics (`--no-heuristics` turns them off, and
 `BrowLowerer*`, `BrowPinch*`, `BrowInnerUp*`, `BrowOuterUp*`, `BrowUp*`, `BrowDown*`,
 `BrowExpression*`.
 
-VRChat's native OSC eye tracking (`/tracking/eye/LeftRightPitchYaw`) is also sent, so any avatar with Eye Look set up follows your gaze even without face-tracking parameters (`--no-native` turns it off). Native blink (`/tracking/eye/EyesClosedAmount`) is opt-in with `--native-blink`: while it is being received, VRChat stops auto-blinking, so an avatar without eyelids configured in Eye Look would never blink. Face-tracking avatars blink through `EyeLid*` either way.
+VRChat's native OSC eye tracking (`/tracking/eye/LeftRightPitchYaw`) is also sent, so any avatar with Eye Look set up follows your gaze even without face-tracking parameters (`--no-native` turns it off). By default both eyes get the same combined gaze, on the native path and in `FT/v2/Eye{Left,Right}X/Y`, so stylised avatars never look cross-eyed. The Lean theorem `Expressions.parallel_uncrossed` proves the two eyes agree. `--vergence` restores real per-eye convergence. Native gaze is also scaled (`--gaze-gain`, default 70%), capped (`--gaze-max`, default 25°) and smoothed (`--smooth`). Native blink (`/tracking/eye/EyesClosedAmount`) is opt-in with `--native-blink`: while it is being received, VRChat stops auto-blinking, so an avatar without eyelids configured in Eye Look would never blink. Face-tracking avatars blink through `EyeLid*` either way.
 
 Each name is sent as `FT/v2/…`, `v2/…` or the v1 names, as a float or bit-packed
 (`Name1/2/4…` plus `NameNegative`), whichever the current avatar actually has. The avatar
