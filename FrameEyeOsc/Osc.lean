@@ -116,4 +116,23 @@ def decode (b : ByteArray) : Option Message := do
   guard (j == b.size)
   pure { address, args := args.toList }
 
+/-- Read a big-endian i32 length at `i`. -/
+def readLen (b : ByteArray) (i : Nat) : Option Nat := (readU32 b i).map (·.toNat)
+
+/-- Decode a packet that may be a `#bundle` (VRChat's output can bundle messages).
+Nested bundles are flattened. Undecodable elements are skipped. -/
+partial def decodePacket (b : ByteArray) : List Message :=
+  if b.size ≥ 16 && b.extract 0 8 == "#bundle".toUTF8.push 0 then Id.run do
+    let mut out : List Message := []
+    let mut i := 16
+    while i + 4 ≤ b.size do
+      match readLen b i with
+      | some n =>
+        if i + 4 + n > b.size then break
+        out := out ++ decodePacket (b.extract (i + 4) (i + 4 + n))
+        i := i + 4 + n
+      | none => break
+    return out
+  else (decode b).toList
+
 end FrameEyeOsc.Osc

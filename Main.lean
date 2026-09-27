@@ -17,11 +17,14 @@ structure Cli where
   dump : Bool := false
   gains : System.FilePath := "data/eye_facial_action.json"
   source : String := "/dev/shm/eye-server.mmap"
-  native : Bool := true                        -- VRChat's /tracking/eye/* (any avatar)
+  native : Bool := true                        -- VRChat's /tracking/eye/* gaze (any avatar with Eye Look)
+  nativeBlink : Bool := false                  -- /tracking/eye/EyesClosedAmount; stops VRChat's auto-blink
+  learnPort : UInt16 := 9001                   -- VRChat's OSC output (--osc=9000:<frame-ip>:9001); 0 = off
 
-def usage : String := "usage: frameeyeosc [--target HOST:PORT] [--prefix FT/] [--no-heuristics] [--no-native] [--dump] [--gains FILE]
+def usage : String := "usage: frameeyeosc [--target HOST:PORT] [--prefix FT/] [--no-heuristics] [--no-native] [--native-blink] [--learn-port 9001] [--dump] [--gains FILE]
   With no --target, VRChat is found over mDNS/OSCQuery and only the current avatar's
-  parameters are sent. With --target, every v2 float is sent to HOST:PORT."
+  parameters are sent. With --target, parameters are learned from VRChat's OSC output
+  (launch VRChat with --osc=9000:<frame-ip>:9001); until then every v2 float is sent."
 
 def parseCli : List String → Cli → Except String Cli
   | [], c => .ok c
@@ -36,6 +39,10 @@ def parseCli : List String → Cli → Except String Cli
     parseCli rest { c with prefix_ := if p.isEmpty || p.endsWith "/" then p else p ++ "/" }
   | "--no-heuristics" :: rest, c => parseCli rest { c with heuristics := false }
   | "--no-native" :: rest, c => parseCli rest { c with native := false }
+  | "--native-blink" :: rest, c => parseCli rest { c with nativeBlink := true }
+  | "--learn-port" :: p :: rest, c => match p.toNat? with
+    | some n => parseCli rest { c with learnPort := n.toUInt16 }
+    | none => .error s!"bad port {p}"
   | "--dump" :: rest, c => parseCli rest { c with dump := true }
   | "--gains" :: f :: rest, c => parseCli rest { c with gains := f }
   | "--source" :: f :: rest, c => parseCli rest { c with source := f }
@@ -74,6 +81,20 @@ partial def discoveryLoop (route : IO.Ref (Option Route)) (avatar : Option Strin
   IO.sleep 3000
   discoveryLoop route next
 
+/-- Listen to VRChat's OSC output and keep the avatar's parameter list. -/
+partial def learnLoop (fd : UInt32) (learned : IO.Ref (Learn.State × Nat)) : IO Unit := do
+  let (pkt, _) ← try Ffi.udpRecv fd 500 catch _ => pure (.empty, "")
+  if pkt.size > 0 then
+    for m in Osc.decodePacket pkt do
+      let (st, n) ← learned.get
+      let (st', changed) := Learn.observe st m
+      if changed then learned.set (st', n + 1)
+  learnLoop fd learned
+
+def routeFor (ip : String) (port : UInt16) (ps : List (String × String)) : Route :=
+  { ip, port, entries := plan ps
+    active := ps.filterMap fun (p, t) => if p.endsWith "EyeTrackingActive" && t != "f" then some p else none }
+
 def oscOf (address : String) : Value → Osc.Message
   | .float q => { address, args := [.f (toFloat q)] }
   | .bool b => { address, args := [.b b] }
@@ -95,10 +116,17 @@ def main (args : List String) : IO UInt32 := do
   | some (ip, port) =>
     route.set (some { ip, port, entries := fallbackPlan cli.prefix_,
                       active := [s!"{paramsPrefix}{cli.prefix_}EyeTrackingActive"] })
-    log s!"sending every v2 parameter to {ip}:{port}"
+    log s!"sending to {ip}:{port}; every v2 float until the avatar's parameters are learned"
   | none =>
     let _ ← IO.asTask (prio := .dedicated) (discoveryLoop route none)
     log "looking for VRChat over mDNS/OSCQuery"
+  let learned ← IO.mkRef ((default : Learn.State), 0)
+  if cli.target.isSome && cli.learnPort != 0 then
+    let fd ← Ffi.udpOpen cli.learnPort 0
+    let _ ← IO.asTask (prio := .dedicated) (learnLoop fd learned)
+    log s!"learning avatar parameters from VRChat's OSC output on UDP {cli.learnPort}"
+  let mut seenVersion := 0
+  let mut changedAt := 0
   openSource cli.source
   log s!"reading {cli.source}"
   let sock ← Ffi.udpOpen 0 0
@@ -111,6 +139,20 @@ def main (args : List String) : IO UInt32 := do
   repeat
     let bytes ← try Ffi.shmNext 1000 catch e => log s!"{e}"; IO.sleep 1000; pure .empty
     let sample := (Shm.decode bytes).filter (·.valid)
+    -- adopt a learned parameter list once it has been quiet for 300 ms
+    if let some (ip, port) := cli.target then
+      let (st, v) ← learned.get
+      let now ← IO.monoMsNow
+      if v != seenVersion then
+        seenVersion := v; changedAt := now
+      else if changedAt != 0 && now - changedAt ≥ 300 then
+        changedAt := 0
+        let ps := st.list
+        let fallback : Route := ⟨ip, port, fallbackPlan cli.prefix_, [s!"{paramsPrefix}{cli.prefix_}EyeTrackingActive"]⟩
+        let r := if ps.isEmpty then fallback else routeFor ip port ps
+        route.set (some r)
+        last := {}
+        log s!"avatar {st.avatar.getD "?"}: {r.entries.length} of {ps.length} parameters driven"
     let r ← route.get
     match sample, r with
     | some s, some r =>
@@ -133,7 +175,7 @@ def main (args : List String) : IO UInt32 := do
         let gazeMsg : Osc.Message := ⟨"/tracking/eye/LeftRightPitchYaw", [.f lp, .f ly, .f rp, .f ry]⟩
         let closedMsg : Osc.Message := ⟨"/tracking/eye/EyesClosedAmount", [.f closed]⟩
         Ffi.udpSend sock r.ip r.port (Osc.encode gazeMsg)
-        Ffi.udpSend sock r.ip r.port (Osc.encode closedMsg)
+        if cli.nativeBlink then Ffi.udpSend sock r.ip r.port (Osc.encode closedMsg)
       if !active || refresh then
         for a in r.active do Ffi.udpSend sock r.ip r.port (Osc.encode (oscOf a (.bool true)))
       active := true

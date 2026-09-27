@@ -8,3 +8,4 @@ import FrameEyeOsc.Ffi
 import FrameEyeOsc.Dns
 import FrameEyeOsc.Discovery
 import FrameEyeOsc.Calib
+import FrameEyeOsc.Learn

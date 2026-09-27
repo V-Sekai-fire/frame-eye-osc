@@ -71,6 +71,25 @@ def avatar : List (String × String) := [
   ("/avatar/parameters/FT/v2/JawOpen", "f"),          -- the Frame cannot drive this
   ("/avatar/parameters/VRCEmote", "i") ]
 
+def bundle (ms : List Osc.Message) : ByteArray :=
+  let elems := ms.flatMap fun m => let b := Osc.encodeList m; Osc.be32 b.length.toUInt32 ++ b
+  ⟨("#bundle".toUTF8.toList ++ [0] ++ List.replicate 8 0 ++ elems).toArray⟩
+
+def vrchatOutput : List Osc.Message :=
+  ⟨"/avatar/change", [.s "avtr_test"]⟩ ::
+  avatar.filterMap fun (p, t) =>
+    if t == "f" then some ⟨p, [.f 0.25]⟩ else if t == "T" then some ⟨p, [.b false]⟩
+    else if t == "i" then some ⟨p, [.i 3]⟩ else none
+
+def bundleOk : Bool :=
+  let ms : List Osc.Message := [⟨"/a", [.f 0.5]⟩, ⟨"/b", [.b true]⟩, ⟨"/c", [.i 7]⟩]
+  Osc.decodePacket (bundle ms) == ms
+
+def learnOk : Bool :=
+  let st := (Osc.decodePacket (bundle vrchatOutput)).foldl (fun st m => (Learn.observe st m).1) default
+  let names (es : List Params.Entry) := (es.map (·.address)).mergeSort (· ≤ ·)
+  st.avatar == some "avtr_test" && names (Params.plan st.list) == names (Params.plan avatar)
+
 def unitChecks : List (String × Bool) :=
   let p := Params.plan avatar
   let widthOf (a : String) := p.findSome? fun e =>
@@ -89,6 +108,8 @@ def unitChecks : List (String × Bool) :=
     ("DNS answer resolves to the service",
       Dns.services "_oscjson._tcp.local" (Dns.parse resp) "0.0.0.0" ==
         [{ instance_ := inst, ip := "192.168.1.50", port := 50123 }]),
+    ("a #bundle of three messages decodes to all three", bundleOk),
+    ("learning from VRChat's output builds the same plan as OSCQuery", learnOk),
     ("DNS query parses back as zero records", (Dns.parse (Dns.query "_oscjson._tcp.local" Dns.typePTR)).isEmpty) ]
 
 def main : IO UInt32 := do

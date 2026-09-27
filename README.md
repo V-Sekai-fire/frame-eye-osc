@@ -20,7 +20,7 @@ From eyelid co-activation heuristics (`--no-heuristics` turns them off, and
 `BrowLowerer*`, `BrowPinch*`, `BrowInnerUp*`, `BrowOuterUp*`, `BrowUp*`, `BrowDown*`,
 `BrowExpression*`.
 
-VRChat's native OSC eye tracking (`/tracking/eye/LeftRightPitchYaw`, `/tracking/eye/EyesClosedAmount`) is also sent, so any avatar with eye-look set up follows your gaze and blinks, even without face-tracking parameters (`--no-native` turns it off).
+VRChat's native OSC eye tracking (`/tracking/eye/LeftRightPitchYaw`) is also sent, so any avatar with Eye Look set up follows your gaze even without face-tracking parameters (`--no-native` turns it off). Native blink (`/tracking/eye/EyesClosedAmount`) is opt-in with `--native-blink`: while it is being received, VRChat stops auto-blinking, so an avatar without eyelids configured in Eye Look would never blink. Face-tracking avatars blink through `EyeLid*` either way.
 
 Each name is sent as `FT/v2/…`, `v2/…` or the v1 names, as a float or bit-packed
 (`Name1/2/4…` plus `NameNegative`), whichever the current avatar actually has. The avatar
@@ -46,7 +46,7 @@ the comments at the top of that file).
   9000) and OSCQuery port (TCP, shown in the log). Allow VRChat through Windows Firewall
   on private networks.
 - VRChat on the Frame: nothing to configure.
-- VRChat's OSCQuery HTTP server only listens on `127.0.0.1`, so from the headset use `--target PC_IP:9000`. For the service, put it in a drop-in, and keep the quotes: `Environment="FRAMEEYEOSC_ARGS=--target 192.168.1.229:9000"`.
+- VRChat's OSCQuery HTTP server only listens on `127.0.0.1`, so from the headset use `--target PC_IP:9000`. To still send exactly the avatar's own parameters (bit-packed ones included), add the Steam launch option `--osc=9000:FRAME_IP:9001` to VRChat. VRChat then sends its OSC output to the headset, and frameeyeosc learns each avatar's parameters on UDP 9001 (`--learn-port`). This moves VRChat's OSC output off the PC, so other apps listening on the PC's 9001 stop receiving it. For the service, put it in a drop-in, and keep the quotes: `Environment="FRAMEEYEOSC_ARGS=--target 192.168.1.229:9000"`.
 - Same when mDNS is blocked: use `--target PC_IP:9000`. That sends every v2 float with the
   `FT/` prefix (`--prefix` changes it) instead of the avatar's own list.
 
