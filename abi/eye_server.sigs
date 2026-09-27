@@ -26,7 +26,7 @@
 #   record   the packed EyeDataMmap at 0x152, 0xebc bytes.
 #
 #   One read:
-#     lock(mutex)             EOWNERDEAD -> pthread_mutex_consistent, then carry on
+#     lock(mutex)             bounded (1 s); EOWNERDEAD -> pthread_mutex_consistent, then carry on
 #     s = sequence; request = 1
 #     unlock(mutex)
 #     futex(&sequence, FUTEX_WAIT, s, timeout)   EAGAIN, EINTR, ETIMEDOUT are not errors
@@ -34,6 +34,10 @@
 #     if sequence != s: copy the record
 #     unlock(mutex)
 #   The copy is valid only when the record's producer_state (u32 at +0x00) is 1.
+#
+#   eyetracking re-creates and re-initializes the object when it starts. A reader that
+#   mapped it earlier holds a dead mapping, so each read also compares the path's inode
+#   with the mapped one and reports a restart. The caller then re-opens.
 #
 # Where the pattern stops short, as it does for nvenc.sigs: a .sigs file cannot say
 # where the fields sit. The record layout lives in FrameEyeOsc/Layout.lean, where its
@@ -51,6 +55,13 @@ int close(int fd);
 int pthread_mutex_lock(pthread_mutex_t *mutex);
 int pthread_mutex_unlock(pthread_mutex_t *mutex);
 int pthread_mutex_consistent(pthread_mutex_t *mutex);
+# Bounded lock: the eye server re-initializes the object when it (re)starts, and a
+# waiter on the old mutex would otherwise block forever.
+int pthread_mutex_timedlock(pthread_mutex_t *mutex, const struct timespec *abstime);
+
+# Detect the object being re-created underneath us (same path, new inode).
+int stat(const char *pathname, struct stat *statbuf);
+int clock_gettime(clockid_t clockid, struct timespec *tp);
 
 # FUTEX_WAIT on the sequence word. glibc has no futex() wrapper.
 long syscall(long number, ...);

@@ -68,6 +68,9 @@ _Static_assert(sizeof(pthread_mutex_t) <= FE_OUTER_METADATA_MUTEX_SIZE, "host mu
 _Static_assert(FE_OUTER_METADATA_MUTEX_OFF % _Alignof(pthread_mutex_t) == 0, "mutex slot misaligned");
 
 static struct fe_eye_server *g_shm = NULL;
+static char g_path[256];
+static ino_t g_ino;
+static dev_t g_dev;
 
 static lean_obj_res fe_err(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 #include <stdarg.h>
@@ -104,7 +107,10 @@ static void fe_unlock(void) {
 
 static int fe_lock(void) {
   fe_block_signals();
-  int rc = pthread_mutex_lock(fe_mutex());
+  struct timespec until;
+  clock_gettime(CLOCK_REALTIME, &until);
+  until.tv_sec += 1;
+  int rc = pthread_mutex_timedlock(fe_mutex(), &until);
   if (rc == EOWNERDEAD) {
     int c = pthread_mutex_consistent(fe_mutex());
     if (c != 0) {
@@ -151,6 +157,9 @@ LEAN_EXPORT lean_obj_res fe_shm_open(b_lean_obj_arg path, lean_obj_arg w) {
     return fe_err("eye shared memory is not initialized yet");
   }
   g_shm = s;
+  snprintf(g_path, sizeof g_path, "%s", p);
+  g_ino = st.st_ino;
+  g_dev = st.st_dev;
   return lean_io_result_mk_ok(lean_box(0));
 }
 
@@ -158,6 +167,9 @@ LEAN_EXPORT lean_obj_res fe_shm_open(b_lean_obj_arg path, lean_obj_arg w) {
 LEAN_EXPORT lean_obj_res fe_shm_next(uint32_t timeout_ms, lean_obj_arg w) {
   (void)w;
   if (!g_shm) return fe_err("eye shared memory is not open");
+  struct stat now;
+  if (stat(g_path, &now) != 0 || now.st_ino != g_ino || now.st_dev != g_dev)
+    return fe_err("eye server restarted (%s was re-created)", g_path);
   int rc = fe_lock();
   if (rc != 0) return fe_err("eye mutex: %s", strerror(rc));
   uint32_t seq = __atomic_load_n(&g_shm->sequence, __ATOMIC_ACQUIRE);

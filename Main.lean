@@ -148,7 +148,13 @@ def main (args : List String) : IO UInt32 := do
   let mut lastSave ← IO.monoMsNow
   let mut lastRefresh ← IO.monoMsNow
   repeat
-    let bytes ← try Ffi.shmNext 1000 catch e => log s!"{e}"; IO.sleep 1000; pure .empty
+    let bytes ← try Ffi.shmNext 1000 catch e => do
+      -- eyetracking restarted or its mutex is wedged: drop the mapping and map it again
+      log s!"{e}; re-opening"
+      Ffi.shmClose
+      IO.sleep 1000
+      openSource cli.source
+      pure .empty
     let sample := (Shm.decode bytes).filter (·.valid)
     -- adopt a learned parameter list once it has been quiet for 300 ms
     if let some (ip, port) := cli.target then
