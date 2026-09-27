@@ -68,6 +68,9 @@ lake exe layout_header --check
 `--dump` prints decoded samples, calibration and outputs. Calibration persists in
 `~/.config/frameeyeosc/calib.json`.
 
+To check the avatar against spoken close/open cues in VRChat, see
+[tools/contact-sheet](tools/contact-sheet/README.md).
+
 ## Parked
 
 - Shelved 2026-09-27: pupil dilation. Which `estimate_extra` float is pupil size is
