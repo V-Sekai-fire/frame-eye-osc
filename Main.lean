@@ -24,6 +24,7 @@ structure Cli where
   vergence : Bool := false                     -- keep per-eye convergence; off = both eyes parallel (never cross-eyed)
   smooth : Float := 0.35                       -- EMA factor per sample for native gaze, 1 = off
   anime : Bool := true                        -- --style anime (default): eyes rebuilt clean from raw values
+  trace : Option String := none                -- append "epoch pitch yaw closed" lines at ~10 Hz
   learnPort : UInt16 := 9001                   -- VRChat's OSC output (--osc=9000:<frame-ip>:9001); 0 = off
 
 def usage : String := "usage: frameeyeosc [--target HOST:PORT] [--prefix FT/] [--no-heuristics] [--no-native] [--native-blink] [--style anime|raw] [--vergence] [--gaze-gain PCT] [--gaze-max DEG] [--smooth PCT] [--learn-port 9001] [--dump] [--gains FILE]
@@ -44,6 +45,7 @@ def parseCli : List String → Cli → Except String Cli
     parseCli rest { c with prefix_ := if p.isEmpty || p.endsWith "/" then p else p ++ "/" }
   | "--no-heuristics" :: rest, c => parseCli rest { c with heuristics := false }
   | "--no-native" :: rest, c => parseCli rest { c with native := false }
+  | "--trace" :: f :: rest, c => parseCli rest { c with trace := some f }
   | "--native-blink" :: rest, c => parseCli rest { c with nativeBlink := true }
   | "--style" :: "anime" :: rest, c => parseCli rest { c with anime := true }
   | "--style" :: "raw" :: rest, c => parseCli rest { c with anime := false }
@@ -163,6 +165,12 @@ def main (args : List String) : IO UInt32 := do
   let mut fPitch : OneEuro := {}
   let mut fYaw : OneEuro := {}
   let mut lastT : Float := 0.0
+  -- wall clock for --trace: one `date` at start, then the monotonic clock
+  let wall0 : Float ← do
+    let o ← IO.Process.output { cmd := "date", args := #["+%s%3N"] }
+    pure ((o.stdout.trim.toNat?.getD 0).toFloat / 1000.0)
+  let mono0 ← IO.monoMsNow
+  let mut lastTrace := 0
   openSource cli.source
   log s!"reading {cli.source}"
   let sock ← Ffi.udpOpen 0 0
@@ -252,6 +260,13 @@ def main (args : List String) : IO UInt32 := do
           if cli.vergence then ⟨"/tracking/eye/LeftRightPitchYaw", gz.toList.map Osc.Arg.f⟩
           else ⟨"/tracking/eye/CenterPitchYaw", [.f gz[0]!, .f gz[1]!]⟩
         Ffi.udpSend sock r.ip r.port (Osc.encode gazeMsg)
+        if let some f := cli.trace then
+          let now ← IO.monoMsNow
+          if now - lastTrace ≥ 100 then
+            lastTrace := now
+            let t := wall0 + (now - mono0).toFloat / 1000.0
+            let closedNow := toFloat (clamp01 ((out.left.blink + out.right.blink) / 2))
+            IO.FS.withFile f .append fun h => h.putStrLn s!"{t} {gz[0]!} {gz[1]!} {closedNow}"
         if cli.nativeBlink then
           let b := toFloat (clamp01 ((out.left.blink + out.right.blink) / 2))
           if cli.anime then
