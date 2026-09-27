@@ -27,7 +27,9 @@ static int parse_ip(const char *s, struct in_addr *out) { return inet_pton(AF_IN
 LEAN_EXPORT lean_obj_res fe_udp_open(uint16_t port, uint8_t reuse, lean_obj_arg w) {
   (void)w;
   int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-  if (fd < 0) return net_err("socket", errno);
+  if (fd < 0) {
+    return net_err("socket", errno);
+  }
   if (reuse) {
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
@@ -46,8 +48,12 @@ LEAN_EXPORT lean_obj_res fe_udp_open(uint16_t port, uint8_t reuse, lean_obj_arg 
 LEAN_EXPORT lean_obj_res fe_udp_join(uint32_t fd, b_lean_obj_arg group, lean_obj_arg w) {
   (void)w;
   struct ip_mreq m = {.imr_interface.s_addr = htonl(INADDR_ANY)};
-  if (!parse_ip(lean_string_cstr(group), &m.imr_multiaddr)) return net_err("multicast group", EINVAL);
-  if (setsockopt((int)fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &m, sizeof m) != 0) return net_err("IP_ADD_MEMBERSHIP", errno);
+  if (!parse_ip(lean_string_cstr(group), &m.imr_multiaddr)) {
+    return net_err("multicast group", EINVAL);
+  }
+  if (setsockopt((int)fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &m, sizeof m) != 0) {
+    return net_err("IP_ADD_MEMBERSHIP", errno);
+  }
   return lean_io_result_mk_ok(lean_box(0));
 }
 
@@ -55,9 +61,13 @@ LEAN_EXPORT lean_obj_res fe_udp_join(uint32_t fd, b_lean_obj_arg group, lean_obj
 LEAN_EXPORT lean_obj_res fe_udp_send(uint32_t fd, b_lean_obj_arg ip, uint16_t port, b_lean_obj_arg data, lean_obj_arg w) {
   (void)w;
   struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(port)};
-  if (!parse_ip(lean_string_cstr(ip), &a.sin_addr)) return net_err(lean_string_cstr(ip), EINVAL);
+  if (!parse_ip(lean_string_cstr(ip), &a.sin_addr)) {
+    return net_err(lean_string_cstr(ip), EINVAL);
+  }
   ssize_t n = sendto((int)fd, lean_sarray_cptr(data), lean_sarray_size(data), 0, (struct sockaddr *)&a, sizeof a);
-  if (n < 0) return net_err("sendto", errno);
+  if (n < 0) {
+    return net_err("sendto", errno);
+  }
   return lean_io_result_mk_ok(lean_box(0));
 }
 
@@ -66,7 +76,9 @@ LEAN_EXPORT lean_obj_res fe_udp_recv(uint32_t fd, uint32_t timeout_ms, lean_obj_
   (void)w;
   struct pollfd p = {.fd = (int)fd, .events = POLLIN};
   int r = poll(&p, 1, (int)timeout_ms);
-  if (r < 0 && errno != EINTR) return net_err("poll", errno);
+  if (r < 0 && errno != EINTR) {
+    return net_err("poll", errno);
+  }
   uint8_t buf[9216];
   ssize_t n = 0;
   char from[INET_ADDRSTRLEN] = "";
@@ -74,7 +86,9 @@ LEAN_EXPORT lean_obj_res fe_udp_recv(uint32_t fd, uint32_t timeout_ms, lean_obj_
     struct sockaddr_in a;
     socklen_t al = sizeof a;
     n = recvfrom((int)fd, buf, sizeof buf, 0, (struct sockaddr *)&a, &al);
-    if (n < 0) return net_err("recvfrom", errno);
+    if (n < 0) {
+      return net_err("recvfrom", errno);
+    }
     inet_ntop(AF_INET, &a.sin_addr, from, sizeof from);
   }
   lean_object *bytes = lean_alloc_sarray(1, (size_t)n, (size_t)n);
@@ -97,9 +111,13 @@ LEAN_EXPORT lean_obj_res fe_http_get(b_lean_obj_arg ip, uint16_t port, b_lean_ob
                                      lean_obj_arg w) {
   (void)w;
   struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(port)};
-  if (!parse_ip(lean_string_cstr(ip), &a.sin_addr)) return net_err(lean_string_cstr(ip), EINVAL);
+  if (!parse_ip(lean_string_cstr(ip), &a.sin_addr)) {
+    return net_err(lean_string_cstr(ip), EINVAL);
+  }
   int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-  if (fd < 0) return net_err("socket", errno);
+  if (fd < 0) {
+    return net_err("socket", errno);
+  }
   struct timeval tv = {.tv_sec = timeout_ms / 1000, .tv_usec = (timeout_ms % 1000) * 1000};
   setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
   setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
@@ -121,11 +139,15 @@ LEAN_EXPORT lean_obj_res fe_http_get(b_lean_obj_arg ip, uint16_t port, b_lean_ob
   for (;;) {
     if (size == cap) {
       cap *= 2;
-      if (cap > (16u << 20)) break;
+      if (cap > (16u << 20)) {
+        break;
+      }
       out = realloc(out, cap + 1);
     }
     ssize_t n = recv(fd, out + size, cap - size, 0);
-    if (n <= 0) break;
+    if (n <= 0) {
+      break;
+    }
     size += (size_t)n;
   }
   close(fd);

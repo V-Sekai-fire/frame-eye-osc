@@ -119,17 +119,23 @@ static int fe_lock(void) {
     }
     return 0;
   }
-  if (rc != 0) pthread_sigmask(SIG_SETMASK, &g_saved, NULL);
+  if (rc != 0) {
+    pthread_sigmask(SIG_SETMASK, &g_saved, NULL);
+  }
   return rc;
 }
 
 // open : String → IO Unit
 LEAN_EXPORT lean_obj_res fe_shm_open(b_lean_obj_arg path, lean_obj_arg w) {
   (void)w;
-  if (g_shm) return lean_io_result_mk_ok(lean_box(0));
+  if (g_shm) {
+    return lean_io_result_mk_ok(lean_box(0));
+  }
   const char *p = lean_string_cstr(path);
   int fd = open(p, O_RDWR | O_CLOEXEC);
-  if (fd < 0) return fe_err("%s: %s", p, strerror(errno));
+  if (fd < 0) {
+    return fe_err("%s: %s", p, strerror(errno));
+  }
   struct stat st;
   if (fstat(fd, &st) != 0) {
     int e = errno;
@@ -143,7 +149,9 @@ LEAN_EXPORT lean_obj_res fe_shm_open(b_lean_obj_arg path, lean_obj_arg w) {
   void *m = mmap(NULL, FE_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
   int e = errno;
   close(fd);
-  if (m == MAP_FAILED) return fe_err("%s: mmap: %s", p, strerror(e));
+  if (m == MAP_FAILED) {
+    return fe_err("%s: mmap: %s", p, strerror(e));
+  }
   struct fe_eye_server *s = m;
   uint32_t version = __atomic_load_n(&s->version, __ATOMIC_ACQUIRE);
   uint32_t init = __atomic_load_n(&s->initialized, __ATOMIC_ACQUIRE);
@@ -166,23 +174,31 @@ LEAN_EXPORT lean_obj_res fe_shm_open(b_lean_obj_arg path, lean_obj_arg w) {
 // next : UInt32 → IO ByteArray. Empty when no new sample arrived within the timeout.
 LEAN_EXPORT lean_obj_res fe_shm_next(uint32_t timeout_ms, lean_obj_arg w) {
   (void)w;
-  if (!g_shm) return fe_err("eye shared memory is not open");
+  if (!g_shm) {
+    return fe_err("eye shared memory is not open");
+  }
   struct stat now;
-  if (stat(g_path, &now) != 0 || now.st_ino != g_ino || now.st_dev != g_dev)
+  if (stat(g_path, &now) != 0 || now.st_ino != g_ino || now.st_dev != g_dev) {
     return fe_err("eye server restarted (%s was re-created)", g_path);
+  }
   int rc = fe_lock();
-  if (rc != 0) return fe_err("eye mutex: %s", strerror(rc));
+  if (rc != 0) {
+    return fe_err("eye mutex: %s", strerror(rc));
+  }
   uint32_t seq = __atomic_load_n(&g_shm->sequence, __ATOMIC_ACQUIRE);
   __atomic_store_n(&g_shm->metadata_requested, 1, __ATOMIC_RELEASE);
   fe_unlock();
 
   struct timespec ts = {.tv_sec = timeout_ms / 1000, .tv_nsec = (long)(timeout_ms % 1000) * 1000000L};
   long r = syscall(SYS_futex, &g_shm->sequence, FUTEX_WAIT, seq, &ts, NULL, 0);
-  if (r == -1 && errno != EAGAIN && errno != EINTR && errno != ETIMEDOUT)
+  if (r == -1 && errno != EAGAIN && errno != EINTR && errno != ETIMEDOUT) {
     return fe_err("futex wait: %s", strerror(errno));
+  }
 
   rc = fe_lock();
-  if (rc != 0) return fe_err("eye mutex: %s", strerror(rc));
+  if (rc != 0) {
+    return fe_err("eye mutex: %s", strerror(rc));
+  }
   lean_object *out;
   if (__atomic_load_n(&g_shm->sequence, __ATOMIC_ACQUIRE) != seq) {
     out = lean_alloc_sarray(1, FE_RECORD_SIZE, FE_RECORD_SIZE);
@@ -196,7 +212,9 @@ LEAN_EXPORT lean_obj_res fe_shm_next(uint32_t timeout_ms, lean_obj_arg w) {
 
 LEAN_EXPORT lean_obj_res fe_shm_close(lean_obj_arg w) {
   (void)w;
-  if (g_shm) munmap(g_shm, FE_SHM_SIZE);
+  if (g_shm) {
+    munmap(g_shm, FE_SHM_SIZE);
+  }
   g_shm = NULL;
   return lean_io_result_mk_ok(lean_box(0));
 }
