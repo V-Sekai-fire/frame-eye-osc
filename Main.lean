@@ -19,8 +19,8 @@ structure Cli where
   source : String := "/dev/shm/eye-server.mmap"
   native : Bool := true                        -- VRChat's /tracking/eye/* gaze (any avatar with Eye Look)
   nativeBlink : Bool := false                  -- /tracking/eye/EyesClosedAmount; stops VRChat's auto-blink
-  gazeGain : Float := 1.0                      -- native gaze scale; 1 = your real gaze angle
-  gazeMax : Float := 45.0                      -- native gaze clamp, degrees
+  gazeGain : Option Float := none              -- gaze scale; default 1.0 raw, 1.8 anime
+  gazeMax : Option Float := none               -- gaze limit in degrees; default 45 raw, 30 anime
   vergence : Bool := false                     -- keep per-eye convergence; off = both eyes parallel (never cross-eyed)
   smooth : Float := 0.35                       -- EMA factor per sample for native gaze, 1 = off
   anime : Bool := true                        -- --style anime (default): eyes rebuilt clean from raw values
@@ -49,8 +49,8 @@ def parseCli : List String → Cli → Except String Cli
   | "--style" :: "raw" :: rest, c => parseCli rest { c with anime := false }
   | "--vergence" :: rest, c => parseCli rest { c with vergence := true }
   | "--per-eye" :: rest, c => parseCli rest { c with vergence := true }
-  | "--gaze-gain" :: v :: rest, c => parseCli rest { c with gazeGain := (v.toNat?.map (·.toFloat / 100.0)).getD c.gazeGain }
-  | "--gaze-max" :: v :: rest, c => parseCli rest { c with gazeMax := (v.toNat?.map (·.toFloat)).getD c.gazeMax }
+  | "--gaze-gain" :: v :: rest, c => parseCli rest { c with gazeGain := v.toNat?.map (·.toFloat / 100.0) }
+  | "--gaze-max" :: v :: rest, c => parseCli rest { c with gazeMax := v.toNat?.map (·.toFloat) }
   | "--smooth" :: v :: rest, c => parseCli rest { c with smooth := (v.toNat?.map (·.toFloat / 100.0)).getD c.smooth }
   | "--learn-port" :: p :: rest, c => match p.toNat? with
     | some n => parseCli rest { c with learnPort := n.toUInt16 }
@@ -207,8 +207,9 @@ def main (args : List String) : IO UInt32 := do
           fPitch := fPitch.step p dtS
           fYaw := fYaw.step y dtS
           let base := Shm.toFrameIn s
-          let gx := ofFloat (fYaw.x / 45.0)
-          let gy := ofFloat (-fPitch.x / 45.0)
+          let ex (a : Float) := Shm.expressive (cli.gazeGain.getD 1.8) (cli.gazeMax.getD 30.0) 1.5 a
+          let gx := ofFloat (ex fYaw.x / 45.0)
+          let gy := ofFloat (-(ex fPitch.x) / 45.0)
           let input : FrameIn := { left := { base.left with x := gx, y := gy }, right := { base.right with x := gx, y := gy } }
           calib := Calib.stepFrame calib input
           animeSt := Anime.step tuning (dtS * 1000.0).toUInt64.toNat animeSt
@@ -231,8 +232,11 @@ def main (args : List String) : IO UInt32 := do
           last := last.insert e.address v
       if cli.native then
         let shape (a : Float) : Float :=
-          let a := a * cli.gazeGain
-          if a > cli.gazeMax then cli.gazeMax else if a < -cli.gazeMax then -cli.gazeMax else a
+          if cli.anime && !cli.vergence then Shm.expressive (cli.gazeGain.getD 1.8) (cli.gazeMax.getD 30.0) 1.5 a
+          else
+            let a := a * cli.gazeGain.getD 1.0
+            let m := cli.gazeMax.getD 45.0
+            if a > m then m else if a < -m then -m else a
         let raw : Array Float :=
           if cli.vergence then
             let (lp, ly) := Shm.pitchYawDeg s.gaze[0]!

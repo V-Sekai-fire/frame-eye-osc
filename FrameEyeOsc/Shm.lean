@@ -75,6 +75,16 @@ def centerDir (s : EyeSample) : Float × Float × Float :=
   let n := Float.sqrt (x * x + y * y + z * z)
   if n < 1.0e-6 then (0.0, 0.0, -1.0) else (x / n, y / n, z / n)
 
+/-- Expressive gaze for stylised eyes, in degrees. A small dead-zone keeps a straight-ahead
+look calm; small glances are boosted by `gain` (real eyes rarely leave ±15°, and anime
+Eye Look limits are tight); large ones ease into `limit` along a tanh, so pupils never
+slam into the socket. Odd, monotone, and bounded by `limit` (see `Proptest`). -/
+def expressive (gain limit dead a : Float) : Float :=
+  let m := a.abs - dead
+  if m ≤ 0.0 || limit ≤ 0.0 then 0.0 else
+    let v := limit * Float.tanh (gain * m / limit)
+    if a < 0.0 then -v else v
+
 /-- Smoothstep from `lo` to `hi`: a decisive blink instead of a hovering eyelid. -/
 def snap (lo hi v : Float) : Float :=
   let t := (v - lo) / (hi - lo)

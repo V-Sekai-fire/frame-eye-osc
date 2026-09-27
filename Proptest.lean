@@ -54,6 +54,12 @@ def props : List (String × IO (Option String)) := [
       (Osc.encode { address := String.ofList (a.filter (· ≠ '\x00')),
                     args := (List.range (n % 9)).map (fun _ => Osc.Arg.f 0.5) }).size % 4 = 0)),
   ("shm record decodes at the Layout offsets", chk (∀ (xs : List Int) (t : Int), shmOk xs t = true)),
+  ("expressive gaze is bounded by its limit", chk (∀ (i : Int) (g : Nat) (l : Nat),
+      (Shm.expressive (1.0 + g.toFloat / 10.0) (1.0 + l.toFloat) 1.5 (Float.ofInt i / 10.0)).abs ≤ 1.0 + l.toFloat)),
+  ("expressive gaze is odd", chk (∀ (i : Int),
+      Shm.expressive 1.8 30.0 1.5 (-(Float.ofInt i / 10.0)) == -(Shm.expressive 1.8 30.0 1.5 (Float.ofInt i / 10.0)))),
+  ("expressive gaze never reverses direction", chk (∀ (i j : Int), i ≤ j →
+      Shm.expressive 1.8 30.0 1.5 (Float.ofInt i / 10.0) ≤ Shm.expressive 1.8 30.0 1.5 (Float.ofInt j / 10.0))),
   ("short buffers never decode", chk (∀ l : List Nat,
       l.length < Layout.recordSize → (Shm.decode ⟨(l.map Nat.toUInt8).toArray⟩).isNone)) ]
 
