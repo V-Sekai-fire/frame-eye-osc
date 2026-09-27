@@ -45,7 +45,19 @@ To restart it from the headset's app list, install the "Frame Eye OSC" app:
 `install -m755 contrib/frameeyeosc-restart ~/.local/bin/` and
 `install -m644 contrib/frameeyeosc.desktop ~/.local/share/applications/`. It restarts
 only this user service and shows its state and last log line as a notification. To
-launch it from Steam, add it as a non-Steam game (Desktop Mode, Steam → Add a Game).
+launch it from Steam without restarting Steam, register it as a devkit game through the
+devkit depot on the headset (Valve's `~/devkit-utils`, uploaded by the devkit client with
+CRLF line endings, so run them with `python3`):
+
+```sh
+cd ~/devkit-utils
+python3 steamos-prepare-upload --gameid frameeyeosc
+install -m755 ~/.local/bin/frameeyeosc-restart ~/devkit-game/frameeyeosc/
+python3 steam-client-create-shortcut --parms '{"gameid":"frameeyeosc","directory":"/home/steamos/devkit-game/frameeyeosc","argv":["./frameeyeosc-restart"],"env":{},"settings":{}}'
+```
+
+It shows in the library as "Devkit Game: frameeyeosc" (`python3 steamos-list-games`).
+The running client ignores `steam://addnonsteamgame/` in the VR gamepad UI.
 
 ## VRChat
 
