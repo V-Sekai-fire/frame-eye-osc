@@ -67,6 +67,20 @@ def pitchYawDeg (v : Float × Float × Float) : Float × Float :=
   let c (a : Float) := if a > 45.0 then 45.0 else if a < -45.0 then -45.0 else a
   (c (-(Float.atan2 y (-z)) * d), c (Float.atan2 x (-z) * d))
 
+/-- The mean of both eyes' directions: one gaze for avatars that should not converge. -/
+def centerDir (s : EyeSample) : Float × Float × Float :=
+  let (a, b, c) := s.gaze[0]!
+  let (d, e, f) := s.gaze[1]!
+  let (x, y, z) := (a + d, b + e, c + f)
+  let n := Float.sqrt (x * x + y * y + z * z)
+  if n < 1.0e-6 then (0.0, 0.0, -1.0) else (x / n, y / n, z / n)
+
+/-- Smoothstep from `lo` to `hi`: a decisive blink instead of a hovering eyelid. -/
+def snap (lo hi v : Float) : Float :=
+  let t := (v - lo) / (hi - lo)
+  let t := if t < 0.0 then 0.0 else if t > 1.0 then 1.0 else t
+  t * t * (3.0 - 2.0 * t)
+
 def toFrameIn (s : EyeSample) : Expressions.FrameIn :=
   let eyeIn (i : Nat) : Expressions.EyeIn :=
     let (ax, ay) := gazeAngles s.gaze[i]!
