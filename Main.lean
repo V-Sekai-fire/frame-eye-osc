@@ -24,6 +24,7 @@ structure Cli where
   vergence : Bool := false                     -- keep per-eye convergence; off = both eyes parallel (never cross-eyed)
   smooth : Float := 0.35                       -- EMA factor per sample for native gaze, 1 = off
   anime : Bool := true                        -- --style anime (default): eyes rebuilt clean from raw values
+  traceCap : Nat := 16384                    -- --trace ring size (~3 min at 90 Hz)
   trace : Option String := none                -- ring of "epoch pitch yaw closed eyeTime" per sample, rewritten each second
   learnPort : UInt16 := 9001                   -- VRChat's OSC output (--osc=9000:<frame-ip>:9001); 0 = off
 
@@ -45,6 +46,7 @@ def parseCli : List String → Cli → Except String Cli
     parseCli rest { c with prefix_ := if p.isEmpty || p.endsWith "/" then p else p ++ "/" }
   | "--no-heuristics" :: rest, c => parseCli rest { c with heuristics := false }
   | "--no-native" :: rest, c => parseCli rest { c with native := false }
+  | "--trace-cap" :: n :: rest, c => parseCli rest { c with traceCap := n.toNat?.getD c.traceCap }
   | "--trace" :: f :: rest, c => parseCli rest { c with trace := some f }
   | "--native-blink" :: rest, c => parseCli rest { c with nativeBlink := true }
   | "--style" :: "anime" :: rest, c => parseCli rest { c with anime := true }
@@ -172,7 +174,7 @@ def main (args : List String) : IO UInt32 := do
   let mono0 ← IO.monoMsNow
   let mut traceRing : Array String := #[]
   let mut lastTrace := 0
-  let traceCap := 4096
+  let traceCap := cli.traceCap
   openSource cli.source
   log s!"reading {cli.source}"
   let sock ← Ffi.udpOpen 0 0
