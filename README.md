@@ -44,6 +44,11 @@ the comments at the top of that file).
 ## VRChat
 
 - Enable OSC in the VRChat Action Menu (Options → OSC → Enabled).
+  VRChat's log prints `OSC enabled: False` at every startup, even with OSC on; ignore it.
+  The saved toggle is `HKCU\Software\VRChat\VRChat` `UI.Settings.Osc_h1043380067`
+  (1 = on), and the Steam launch option `--osc=...` shows in the log as `Arg: --osc=...`.
+  If the avatar's eyes stop while the service is active and the journal shows no
+  `avatar …` lines, VRChat's output is not reaching UDP 9001: see the watchdog note below.
 - VRChat on a PC, streamed to the Frame: the headset must reach the PC's OSC port (UDP
   9000) and OSCQuery port (TCP, shown in the log). Allow VRChat through Windows Firewall
   on private networks.
