@@ -51,6 +51,10 @@ the comments at the top of that file).
 - VRChat's OSCQuery HTTP server only listens on `127.0.0.1`, so from the headset use `--target PC_IP:9000`. To still send exactly the avatar's own parameters (bit-packed ones included), add the Steam launch option `--osc=9000:FRAME_IP:9001` to VRChat. VRChat then sends its OSC output to the headset, and frameeyeosc learns each avatar's parameters on UDP 9001 (`--learn-port`). This moves VRChat's OSC output off the PC, so other apps listening on the PC's 9001 stop receiving it. For the service, put it in a drop-in, and keep the quotes: `Environment="FRAMEEYEOSC_ARGS=--target 192.168.1.229:9000"`.
 - Same when mDNS is blocked: use `--target PC_IP:9000`. That sends every v2 float with the
   `FT/` prefix (`--prefix` changes it) instead of the avatar's own list.
+- The learn listener re-opens after 15 s of VRChat OSC silence (backing off to 120 s), and
+  a heartbeat logs every 5 min; check with
+  `journalctl --user -u frameeyeosc | grep -E "re-open|heartbeat"`. The re-open path has
+  not yet been exercised by a real reboot.
 
 ## Checks
 
@@ -63,3 +67,23 @@ lake exe layout_header --check
 
 `--dump` prints decoded samples, calibration and outputs. Calibration persists in
 `~/.config/frameeyeosc/calib.json`.
+
+## Parked
+
+- Shelved 2026-09-27: pupil dilation. Which `estimate_extra` float is pupil size is
+  unidentified; `extra[4..7]` summed is the held-closure signal instead. Unpark when a
+  `--dump` lens-light cover/uncover test identifies it.
+- Shelved 2026-09-27: phase 2 eye-camera frame tap, reading the cDSP gazenet I/O dmabuf
+  of Valve's eyetracking. It needs the owner to grant access (`setcap` or a permission
+  rule) and is not pursued otherwise. Unpark when the owner runs it or grants the rule.
+- Shelved 2026-09-27: voice-cue cloning for the cue recordings, a custom voice from the
+  owner's accent video by the maskscore methodology. WavLM scoring needs torch ≥ 2.6; the
+  cues use Windows SAPI now. Unpark when a torch ≥ 2.6 env exists and the cues need a
+  custom voice.
+- Shelved 2026-09-27: CineForm capture for contact sheets was requested and not set up;
+  PNG ring capture (PrintWindow) is in use. Unpark when PNG capture is too slow or large.
+- Shelved 2026-09-27: avatar-person segmentation for face crops (RF-DETR fine-tuned on VRM
+  renders, the full 5k render corpus). Faces are the "Car" on RFD 2262's board, and the
+  face contact sheet works today with RF-DETR (ggml-rd, dress-on gate 9), BiRefNet_HR-matting
+  and MoGe-3 depth checks (anny-render-corpus PR #41, rf-detr-ggml PR #25). Unpark when a
+  vehicle needs avatar-person detection.
