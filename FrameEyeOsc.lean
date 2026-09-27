@@ -9,3 +9,4 @@ import FrameEyeOsc.Dns
 import FrameEyeOsc.Discovery
 import FrameEyeOsc.Calib
 import FrameEyeOsc.Learn
+import FrameEyeOsc.Anime

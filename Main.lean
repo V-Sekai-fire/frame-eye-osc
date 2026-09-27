@@ -23,9 +23,10 @@ structure Cli where
   gazeMax : Float := 45.0                      -- native gaze clamp, degrees
   vergence : Bool := false                     -- keep per-eye convergence; off = both eyes parallel (never cross-eyed)
   smooth : Float := 0.35                       -- EMA factor per sample for native gaze, 1 = off
+  anime : Bool := true                        -- --style anime (default): eyes rebuilt clean from raw values
   learnPort : UInt16 := 9001                   -- VRChat's OSC output (--osc=9000:<frame-ip>:9001); 0 = off
 
-def usage : String := "usage: frameeyeosc [--target HOST:PORT] [--prefix FT/] [--no-heuristics] [--no-native] [--native-blink] [--vergence] [--gaze-gain PCT] [--gaze-max DEG] [--smooth PCT] [--learn-port 9001] [--dump] [--gains FILE]
+def usage : String := "usage: frameeyeosc [--target HOST:PORT] [--prefix FT/] [--no-heuristics] [--no-native] [--native-blink] [--style anime|raw] [--vergence] [--gaze-gain PCT] [--gaze-max DEG] [--smooth PCT] [--learn-port 9001] [--dump] [--gains FILE]
   With no --target, VRChat is found over mDNS/OSCQuery and only the current avatar's
   parameters are sent. With --target, parameters are learned from VRChat's OSC output
   (launch VRChat with --osc=9000:<frame-ip>:9001); until then every v2 float is sent."
@@ -44,6 +45,8 @@ def parseCli : List String → Cli → Except String Cli
   | "--no-heuristics" :: rest, c => parseCli rest { c with heuristics := false }
   | "--no-native" :: rest, c => parseCli rest { c with native := false }
   | "--native-blink" :: rest, c => parseCli rest { c with nativeBlink := true }
+  | "--style" :: "anime" :: rest, c => parseCli rest { c with anime := true }
+  | "--style" :: "raw" :: rest, c => parseCli rest { c with anime := false }
   | "--vergence" :: rest, c => parseCli rest { c with vergence := true }
   | "--per-eye" :: rest, c => parseCli rest { c with vergence := true }
   | "--gaze-gain" :: v :: rest, c => parseCli rest { c with gazeGain := (v.toNat?.map (·.toFloat / 100.0)).getD c.gazeGain }
@@ -63,6 +66,23 @@ structure Route where
   port : UInt16
   entries : List Entry
   active : List String
+
+/-- One Euro filter (Casiez et al. 2012): steady at rest, fast on a saccade. -/
+structure OneEuro where
+  x : Float := 0.0
+  dx : Float := 0.0
+  primed : Bool := false
+
+def OneEuro.alpha (cutoff dt : Float) : Float :=
+  let tau := 1.0 / (2.0 * 3.141592653589793 * cutoff)
+  1.0 / (1.0 + tau / dt)
+
+def OneEuro.step (f : OneEuro) (v dt : Float) (minCutoff := 1.2) (beta := 0.04) (dCutoff := 1.0) : OneEuro :=
+  if !f.primed || dt ≤ 0.0 then { x := v, dx := 0.0, primed := true } else
+    let d := (v - f.x) / dt
+    let dx := f.dx + OneEuro.alpha dCutoff dt * (d - f.dx)
+    let cutoff := minCutoff + beta * dx.abs
+    { x := f.x + OneEuro.alpha cutoff dt * (v - f.x), dx, primed := true }
 
 def log (s : String) : IO Unit := do IO.eprintln s!"[frameeyeosc] {s}"
 
@@ -138,6 +158,11 @@ def main (args : List String) : IO UInt32 := do
   let mut changedAt := 0
   let mut gz : Array Float := #[0.0, 0.0, 0.0, 0.0]   -- smoothed native gaze (pitch, yaw, pitch, yaw)
   let mut closedS : Float := 0.0
+  let mut animeSt : Anime.State := {}
+  let tuning : Anime.Tuning := {}
+  let mut fPitch : OneEuro := {}
+  let mut fYaw : OneEuro := {}
+  let mut lastT : Float := 0.0
   openSource cli.source
   log s!"reading {cli.source}"
   let sock ← Ffi.udpOpen 0 0
@@ -173,9 +198,28 @@ def main (args : List String) : IO UInt32 := do
     let r ← route.get
     match sample, r with
     | some s, some r =>
-      let input := if cli.vergence then Shm.toFrameIn s else (Shm.toFrameIn s).parallel
-      calib := Calib.stepFrame calib input
-      let out := frame gains cli.heuristics calib input
+      let dtS := if lastT == 0.0 then 0.011 else max 0.0 (min 0.1 (s.time - lastT))
+      lastT := s.time
+      let (input, out) ←
+        if cli.anime && !cli.vergence then do
+          -- one gaze for both eyes, filtered in degrees, then back to the ±45° ↦ ±1 scale
+          let (p, y) := Shm.pitchYawDeg (Shm.centerDir s)
+          fPitch := fPitch.step p dtS
+          fYaw := fYaw.step y dtS
+          let base := Shm.toFrameIn s
+          let gx := ofFloat (fYaw.x / 45.0)
+          let gy := ofFloat (-fPitch.x / 45.0)
+          let input : FrameIn := { left := { base.left with x := gx, y := gy }, right := { base.right with x := gx, y := gy } }
+          calib := Calib.stepFrame calib input
+          animeSt := Anime.step tuning (dtS * 1000.0).toUInt64.toNat animeSt
+            (Anime.rel calib.left input.left.openness) (Anime.rel calib.right input.right.openness)
+          let out := Anime.styleFrame tuning gains cli.heuristics calib input animeSt (frame gains cli.heuristics calib input)
+          pure (input, out)
+        else do
+          let input := if cli.vergence then Shm.toFrameIn s else (Shm.toFrameIn s).parallel
+          calib := Calib.stepFrame calib input
+          pure (input, frame gains cli.heuristics calib input)
+      let _ := input
       let now ← IO.monoMsNow
       -- resend everything once a second so a VRChat restart or late join catches up
       let refresh := now - lastRefresh > 1000
@@ -194,19 +238,24 @@ def main (args : List String) : IO UInt32 := do
             let (lp, ly) := Shm.pitchYawDeg s.gaze[0]!
             let (rp, ry) := Shm.pitchYawDeg s.gaze[1]!
             #[shape lp, shape ly, shape rp, shape ry]
+          else if cli.anime then
+            #[shape fPitch.x, shape fYaw.x, shape fPitch.x, shape fYaw.x]
           else
             let (p, y) := Shm.pitchYawDeg (Shm.centerDir s)
             #[shape p, shape y, shape p, shape y]
-        gz := (gz.zip raw).map fun (o, n) => o + cli.smooth * (n - o)
+        gz := if cli.anime then raw else (gz.zip raw).map fun (o, n) => o + cli.smooth * (n - o)
         let gazeMsg : Osc.Message :=
           if cli.vergence then ⟨"/tracking/eye/LeftRightPitchYaw", gz.toList.map Osc.Arg.f⟩
           else ⟨"/tracking/eye/CenterPitchYaw", [.f gz[0]!, .f gz[1]!]⟩
         Ffi.udpSend sock r.ip r.port (Osc.encode gazeMsg)
         if cli.nativeBlink then
           let b := toFloat (clamp01 ((out.left.blink + out.right.blink) / 2))
-          -- close fast, open a little slower, and snap past half-closure
-          let target := Shm.snap 0.35 0.75 b
-          closedS := closedS + (if target > closedS then 0.8 else 0.4) * (target - closedS)
+          if cli.anime then
+            closedS := b     -- already a clean blink curve
+          else
+            -- close fast, open a little slower, and snap past half-closure
+            let target := Shm.snap 0.35 0.75 b
+            closedS := closedS + (if target > closedS then 0.8 else 0.4) * (target - closedS)
           let closedMsg : Osc.Message := ⟨"/tracking/eye/EyesClosedAmount", [.f closedS]⟩
           Ffi.udpSend sock r.ip r.port (Osc.encode closedMsg)
       if !active || refresh then

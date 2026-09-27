@@ -18,6 +18,7 @@ does not need to run anywhere.
 | blink and wide never both nonzero | theorem | `Expressions.blink_wide_exclusive` |
 | mirroring the face mirrors every output | theorem | `Expressions.frame_mirror` |
 | parallel mode: both eyes always report the same gaze, and it commutes with mirroring | theorems | `Expressions.parallel_uncrossed`, `parallel_mirror` |
+| anime style keeps every rebuilt channel in range; shut shows fully shut and open shows fully open | theorems | `Anime.eye_style_valid`, `frame_style_valid`, `closed_level`, `opened_level` |
 | binary level fits its bits; truncation error under one step; bits round-trip (1–6 bits) | theorems | `Params.level_lt`, `level_error`, `bits_roundtrip_*` |
 | OSC packets are whole 32-bit words | theorem | `Osc.encode_len_mod4` |
 | OSC decode ∘ encode, shm decode, `ofFloat`, DNS, parameter matching | plausible properties | `Proptest.lean` |
