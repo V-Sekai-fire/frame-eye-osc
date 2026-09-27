@@ -19,8 +19,8 @@ structure Cli where
   source : String := "/dev/shm/eye-server.mmap"
   native : Bool := true                        -- VRChat's /tracking/eye/* gaze (any avatar with Eye Look)
   nativeBlink : Bool := false                  -- /tracking/eye/EyesClosedAmount; stops VRChat's auto-blink
-  gazeGain : Float := 0.7                      -- native gaze scale (anime eyes look wrong at 1:1)
-  gazeMax : Float := 25.0                      -- native gaze clamp, degrees
+  gazeGain : Float := 1.0                      -- native gaze scale; 1 = your real gaze angle
+  gazeMax : Float := 45.0                      -- native gaze clamp, degrees
   vergence : Bool := false                     -- keep per-eye convergence; off = both eyes parallel (never cross-eyed)
   smooth : Float := 0.35                       -- EMA factor per sample for native gaze, 1 = off
   learnPort : UInt16 := 9001                   -- VRChat's OSC output (--osc=9000:<frame-ip>:9001); 0 = off
