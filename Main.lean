@@ -127,8 +127,13 @@ partial def learnLoop (fd : UInt32) (learned : IO.Ref (Learn.State × Nat)) : IO
       if changed then learned.set (st', n + 1)
   learnLoop fd learned
 
-def routeFor (ip : String) (port : UInt16) (ps : List (String × String)) : Route :=
-  { ip, port, entries := plan ps
+/-- The learned plan adds to the fallback v2 floats instead of replacing them: a learned
+list is often partial (VRChat's parameter dump arrives as many UDP datagrams, and some are
+lost over Wi-Fi), and an avatar must never end up driven by nothing. -/
+def routeFor (ip : String) (port : UInt16) (pre : String) (ps : List (String × String)) : Route :=
+  let learned := plan ps
+  let extra := (fallbackPlan pre).filter fun e => !learned.any (·.address == e.address)
+  { ip, port, entries := learned ++ extra
     active := ps.filterMap fun (p, t) => if p.endsWith "EyeTrackingActive" && t != "f" then some p else none }
 
 def oscOf (address : String) : Value → Osc.Message
@@ -212,10 +217,10 @@ def main (args : List String) : IO UInt32 := do
         changedAt := 0
         let ps := st.list
         let fallback : Route := ⟨ip, port, fallbackPlan cli.prefix_, [s!"{paramsPrefix}{cli.prefix_}EyeTrackingActive"]⟩
-        let r := if ps.isEmpty then fallback else routeFor ip port ps
+        let r := if ps.isEmpty then fallback else routeFor ip port cli.prefix_ ps
         route.set (some r)
         last := {}
-        log s!"avatar {st.avatar.getD "?"}: {r.entries.length} of {ps.length} parameters driven"
+        log s!"avatar {st.avatar.getD "?"}: {(plan ps).length} learned of {ps.length} seen, {r.entries.length} driven with the v2 fallback"
     let r ← route.get
     match sample, r with
     | some s, some r =>
@@ -327,6 +332,9 @@ def main (args : List String) : IO UInt32 := do
           else 0.0
         let closedMsg : Osc.Message := ⟨"/tracking/eye/EyesClosedAmount", [.f lvl]⟩
         Ffi.udpSend sock r.ip r.port (Osc.encode closedMsg)
+      if now - lastSampleAt > 1000 then
+        shut := false            -- a stale "shut" must not outlive the data it came from
+        animeSt := {}
       if active && now - lastSampleAt > 1000 then
         for a in r.active do Ffi.udpSend sock r.ip r.port (Osc.encode (oscOf a (.bool false)))
         active := false
