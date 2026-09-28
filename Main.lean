@@ -244,23 +244,33 @@ def main (args : List String) : IO UInt32 := do
     let nowW ← IO.monoMsNow
     if learning then
       let h ← heard.get
-      if nowW - h.lastMs < reopenBackoff then
+      if h.lastMs > reopenAt then
+        -- heard VRChat since the last re-open (or start): the listener works
         reopenBackoff := 15000
-      else if nowW - reopenAt ≥ reopenBackoff then
-        -- retire the old listener first: bump its generation, close its socket (a
-        -- listener stuck in poll wakes on the closed fd and sees it is stale)
+      if nowW - h.lastMs ≥ 15000 && nowW - reopenAt ≥ reopenBackoff then
+        -- retire the old listener first: bump its generation, close its socket. The
+        -- kernel keeps the port bound until the old listener's poll (500 ms) returns,
+        -- so the new bind is retried for up to 800 ms (seen: EADDRINUSE on every other
+        -- re-open without it).
         let g ← learnGen.modifyGet fun g => (g + 1, g + 1)
         if let some fd := learnFd then
           Ffi.udpClose fd
         learnFd := none
         reopens := reopens + 1
-        try
-          learnFd := some (← startLearn cli.learnPort learned heard learnGen g)
-          log s!"no VRChat OSC on UDP {cli.learnPort} for {(nowW - h.lastMs) / 1000} s: listener re-opened (#{reopens}); next check in {reopenBackoff / 1000} s"
-        catch e =>
-          log s!"re-opening UDP {cli.learnPort} failed: {e}"
         reopenAt := nowW
         reopenBackoff := min 120000 (2 * reopenBackoff)
+        let mut err := ""
+        for _ in [0:8] do
+          if learnFd.isNone then
+            try
+              learnFd := some (← startLearn cli.learnPort learned heard learnGen g)
+            catch e =>
+              err := toString e
+              IO.sleep 100
+        if learnFd.isSome then
+          log s!"no VRChat OSC on UDP {cli.learnPort} for {(nowW - h.lastMs) / 1000} s: listener re-opened (#{reopens}); next check in {reopenBackoff / 1000} s"
+        else
+          log s!"re-opening UDP {cli.learnPort} failed: {err}; next try in {reopenBackoff / 1000} s"
     if nowW - beatAt ≥ 300000 then
       let h ← heard.get
       let (st, _) ← learned.get
