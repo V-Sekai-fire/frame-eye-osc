@@ -23,17 +23,13 @@ slang_to_cpp(main ${CMAKE_CURRENT_BINARY_DIR}/main.cpp)
 add_executable(frameeyeosc ${CMAKE_CURRENT_BINARY_DIR}/main.cpp)
 target_compile_options(frameeyeosc PRIVATE -Wno-main)
 
-option(FRAMEEYEOSC_BUILD_TESTS "Build the witness-cpp tests (vendored in thirdparty/)" ${PROJECT_IS_TOP_LEVEL})
-if(FRAMEEYEOSC_BUILD_TESTS)
-  slang_to_cpp(core ${CMAKE_CURRENT_BINARY_DIR}/core.cpp)
-  add_library(frameeyeosc_core STATIC ${CMAKE_CURRENT_BINARY_DIR}/core.cpp)
-  find_package(Threads REQUIRED)
-  target_link_libraries(frameeyeosc_core PUBLIC Threads::Threads)
-  enable_testing()
-  add_executable(frameeyeosc_tests tests/main.cpp tests/test_bridge.cpp tests/test_eye_server.cpp tests/test_osc.cpp
-    tests/test_expressions.cpp tests/test_anime.cpp tests/test_params.cpp)
-  target_include_directories(frameeyeosc_tests PRIVATE tests thirdparty/witness-cpp/include)
-  target_link_libraries(frameeyeosc_tests PRIVATE frameeyeosc_core)
-  target_compile_options(frameeyeosc_tests PRIVATE -Wall -Wextra -Werror)
-  add_test(NAME frameeyeosc_tests COMMAND frameeyeosc_tests)
+# The tests are an optional Lean package in tests/ (lake fetches plausible-witness-dag).
+option(FRAMEEYEOSC_LEAN_TESTS "Add a lean_tests target that builds and runs tests/ with lake" OFF)
+if(FRAMEEYEOSC_LEAN_TESTS)
+  find_program(LAKE lake REQUIRED)
+  add_custom_target(lean_tests
+    COMMAND ${LAKE} build
+    COMMAND ${LAKE} exe tests
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/tests
+    USES_TERMINAL)
 endif()

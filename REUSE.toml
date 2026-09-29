@@ -6,6 +6,6 @@ SPDX-FileCopyrightText = ["2026 K. S. Ernest (iFire) Lee", "2026 konsti219"]
 SPDX-License-Identifier = "MIT"
 
 [[annotations]]
-path = ["thirdparty/witness-cpp/LICENSE", "thirdparty/witness-cpp/README.md"]
+path = ["tests/lean-toolchain", "tests/lake-manifest.json"]
 SPDX-FileCopyrightText = "2026 K. S. Ernest (iFire) Lee"
 SPDX-License-Identifier = "MIT"

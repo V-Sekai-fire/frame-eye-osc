@@ -16,11 +16,13 @@ cmake --build build
 ./build/frameeyeosc --target 127.0.0.1:9000
 ```
 
-Tests are C++ with witness-cpp (vendored in `thirdparty/`, so nothing is fetched), against the functions `src/core.slang` exports:
+Tests are an optional Lean package in `tests/`. Lake builds `src/core.slang` with a small C++ shim (`tests/ffi/`) and runs unit checks plus [plausible-witness-dag](https://github.com/fire/plausible-witness-dag) property searches, each paired with a control that plants the defect the property rules out. Lake fetches its dependencies, so this step needs the network; the driver's own build does not.
 
 ```sh
-cmake -S . -B build && cmake --build build && ./build/frameeyeosc_tests
+cd tests && lake build && lake exe tests
 ```
+
+or `cmake -S . -B build -DFRAMEEYEOSC_LEAN_TESTS=ON && cmake --build build --target lean_tests`.
 
 `contrib/frameeyeosc.service` runs it as a user service.
 
