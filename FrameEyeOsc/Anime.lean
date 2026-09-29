@@ -10,8 +10,7 @@ channels from the raw per-eye openness:
 * **Blinks are events.** Openness below `closeAt` starts a blink: the lid shuts in
   `closeMs`, stays shut until openness passes `openAt` (hysteresis), then eases open over
   `openMs`. Wobble between blinks never reaches the avatar.
-* **Eyes blink together.** When one eye blinks and the other is merely low, both close.
-  A wink is kept only if the other eye stays clearly open.
+* **Each eye blinks on its own reading.** One eye closing never pulls the other along.
 * **Squint is held, not passed through.** Only partial closure sustained for
   `squintAfterMs` becomes a squint, so a blink's half-way frames never show as one.
 * **The lid follows the gaze.** Looking down lowers the upper lid a little, as anime rigs do.
@@ -29,7 +28,6 @@ open FrameEyeOsc Expressions
 structure Tuning where
   closeAt       : Int := 3500    -- raw openness (fraction of relaxed-open) that starts a blink
   openAt        : Int := 5500    -- and that ends it
-  linkAt        : Int := 4500    -- the other eye closes too if it is below this
   closeMs       : Nat := 60
   openMs        : Nat := 140
   squintAt      : Int := 8000    -- partial closure below this counts toward a squint
@@ -88,8 +86,6 @@ def stepEye (k : Tuning) (dt : Nat) (s : EyeState) (r : Int) : EyeState :=
     if r < k.closeAt then start k s .closing
     else if s.t ≥ k.openMs then start k s .opened else s
 
-def closingish (s : EyeState) : Bool := s.phase == .closing || s.phase == .closed
-
 /-- A wink the fused openness misses. The tracker reports both lids shut during a wink,
 but only the closed eye loses its gaze fix; the eye it still sees is held open. -/
 def winkGate (occL occR : Bool) (rl rr : Int) : Int × Int :=
@@ -111,13 +107,9 @@ theorem winkGate_opens_seen (rl rr : Int) :
     unit ≤ (winkGate true false rl rr).2 ∧ unit ≤ (winkGate false true rl rr).1 := by
   simp [winkGate]; omega
 
-/-- Step both eyes, then link them: a blink pulls the other eye along unless it is clearly open. -/
+/-- Step each eye independently. -/
 def step (k : Tuning) (dt : Nat) (st : State) (rl rr : Int) : State :=
-  let l := stepEye k dt st.left rl
-  let r := stepEye k dt st.right rr
-  let follow (me other : EyeState) (mine : Int) : EyeState :=
-    if closingish other && !closingish me && mine < k.linkAt then start k me .closing else me
-  { left := follow l r rl, right := follow r l rr }
+  { left := stepEye k dt st.left rl, right := stepEye k dt st.right rr }
 
 /-- Rebuild one eye's lid channels from the style state. Gaze, look and co-activation
 gains are kept from the base mapping; everything rebuilt goes through `clamp01`. -/
