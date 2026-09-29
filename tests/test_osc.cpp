@@ -1,87 +1,126 @@
+// SPDX-FileCopyrightText: 2026 K. S. Ernest (iFire) Lee
 // SPDX-License-Identifier: MIT
-#include "osc.hpp"
+#include "abi.h"
 
-#include "witness/doctest.h"
+#include "check.hpp"
+#include "witness_check.hpp"
 
 #include <cstring>
-#include <functional>
 
-using frameeyeosc::osc::Message;
-namespace osc = frameeyeosc::osc;
-
-TEST_CASE("a float message encodes as padded address, tag and big-endian value") {
-  std::vector<uint8_t> b = osc::encode(Message{"/a", {osc::float_arg(1.0f)}});
+TEST(float_message_encodes_padded) {
+  fe_message m = fe_message_of("/a");
+  fe_add_float(m, 1.0f);
+  uint8_t b[64];
+  int n = fe_osc_encode(&m, b, sizeof b);
   const uint8_t want[] = {'/', 'a', 0, 0, ',', 'f', 0, 0, 0x3f, 0x80, 0, 0};
-  REQUIRE(b.size() == sizeof want);
-  CHECK(std::memcmp(b.data(), want, sizeof want) == 0);
+  REQUIRE(n == (int)sizeof want);
+  CHECK(std::memcmp(b, want, sizeof want) == 0);
 }
 
-TEST_CASE("an address of four characters still gets a terminator") {
-  std::vector<uint8_t> b = osc::encode(Message{"/abc", {osc::bool_arg(true)}});
+TEST(four_character_address_still_gets_a_terminator) {
+  fe_message m = fe_message_of("/abc");
+  fe_add_bool(m, true);
+  uint8_t b[64];
+  int n = fe_osc_encode(&m, b, sizeof b);
   const uint8_t want[] = {'/', 'a', 'b', 'c', 0, 0, 0, 0, ',', 'T', 0, 0};
-  REQUIRE(b.size() == sizeof want);
-  CHECK(std::memcmp(b.data(), want, sizeof want) == 0);
+  REQUIRE(n == (int)sizeof want);
+  CHECK(std::memcmp(b, want, sizeof want) == 0);
 }
 
-TEST_CASE("a bundle of three messages decodes to all three") {
-  std::vector<Message> ms = {Message{"/a", {osc::float_arg(0.5f)}}, Message{"/b", {osc::bool_arg(true)}},
-                             Message{"/c", {osc::int_arg(7)}}};
-  std::vector<uint8_t> b = osc::bundle(ms);
-  std::vector<Message> got = osc::decode_packet(b.data(), b.size());
-  REQUIRE(got.size() == 3);
-  CHECK(got[0] == ms[0]);
-  CHECK(got[1] == ms[1]);
-  CHECK(got[2] == ms[2]);
+TEST(encode_refuses_a_small_buffer) {
+  fe_message m = fe_message_of("/abc");
+  fe_add_float(m, 0.5f);
+  uint8_t b[8];
+  CHECK(fe_osc_encode(&m, b, sizeof b) == 0);
 }
 
-TEST_CASE("a truncated message does not decode (control)") {
-  std::vector<uint8_t> b = osc::encode(Message{"/abc", {osc::float_arg(0.5f)}});
-  Message m;
-  CHECK(osc::decode(b.data(), b.size(), m));
-  CHECK_FALSE(osc::decode(b.data(), b.size() - 1, m));
+TEST(bundle_of_three_decodes_to_all_three) {
+  static fe_message ms[3];
+  ms[0] = fe_message_of("/a");
+  fe_add_float(ms[0], 0.5f);
+  ms[1] = fe_message_of("/b");
+  fe_add_bool(ms[1], true);
+  ms[2] = fe_message_of("/c");
+  fe_add_int(ms[2], 7);
+  uint8_t b[256];
+  int n = fe_osc_bundle(ms, 3, b, sizeof b);
+  REQUIRE(n > 0);
+  static fe_message got[8];
+  REQUIRE(fe_osc_decode_packet(b, n, got, 8) == 3);
+  CHECK(fe_osc_equal(&got[0], &ms[0]));
+  CHECK(fe_osc_equal(&got[1], &ms[1]));
+  CHECK(fe_osc_equal(&got[2], &ms[2]));
 }
 
-static Message gen_message(witness::RNG &rng, const witness::Level &) {
-  Message m;
-  m.address = "/avatar/parameters/";
-  uint32_t n = rng.uint_range(0, 30);
-  for (uint32_t k = 0; k < n; ++k) {
-    m.address.push_back(static_cast<char>('a' + rng.uint_range(0, 25)));
+TEST(nested_bundle_is_flattened) {
+  static fe_message inner[2];
+  inner[0] = fe_message_of("/x");
+  fe_add_int(inner[0], 1);
+  inner[1] = fe_message_of("/y");
+  fe_add_int(inner[1], 2);
+  uint8_t in[256];
+  int n_in = fe_osc_bundle(inner, 2, in, sizeof in);
+  REQUIRE(n_in > 0);
+  // An outer bundle whose one element is the inner bundle.
+  uint8_t out[512] = {'#', 'b', 'u', 'n', 'd', 'l', 'e', 0};
+  out[16] = (uint8_t)(n_in >> 24);
+  out[17] = (uint8_t)(n_in >> 16);
+  out[18] = (uint8_t)(n_in >> 8);
+  out[19] = (uint8_t)n_in;
+  std::memcpy(out + 20, in, (size_t)n_in);
+  static fe_message got[8];
+  REQUIRE(fe_osc_decode_packet(out, 20 + n_in, got, 8) == 2);
+  CHECK(fe_osc_equal(&got[1], &inner[1]));
+}
+
+TEST(control_truncated_message_does_not_decode) {
+  fe_message m = fe_message_of("/abc");
+  fe_add_float(m, 0.5f);
+  uint8_t b[64];
+  int n = fe_osc_encode(&m, b, sizeof b);
+  static fe_message back;
+  CHECK(fe_osc_decode(b, n, &back));
+  CHECK(!fe_osc_decode(b, n - 1, &back));
+}
+
+static fe_message gen_message(witness::RNG &p_rng, const witness::Level &) {
+  char address[64] = "/avatar/parameters/";
+  size_t n = p_rng.uint_range(0, 30);
+  for (size_t k = 0; k < n; ++k) {
+    address[19 + k] = (char)('a' + p_rng.uint_range(0, 25));
   }
-  uint32_t args = rng.uint_range(0, 4);
+  address[19 + n] = 0;
+  fe_message m = fe_message_of(address);
+  uint32_t args = p_rng.uint_range(0, 4);
   for (uint32_t k = 0; k < args; ++k) {
-    uint32_t kind = rng.uint_range(0, 3);
+    uint32_t kind = p_rng.uint_range(0, 3);
     if (kind == 0) {
-      m.args.push_back(osc::float_arg(static_cast<float>(rng.int_range(-100000, 100000)) / 97.0f));
+      fe_add_float(m, (float)p_rng.int_range(-100000, 100000) / 97.0f);
     } else if (kind == 1) {
-      m.args.push_back(osc::int_arg(rng.int_range(-100000, 100000)));
+      fe_add_int(m, p_rng.int_range(-100000, 100000));
     } else if (kind == 2) {
-      m.args.push_back(osc::bool_arg(rng.uint_range(0, 1) == 1));
+      fe_add_bool(m, p_rng.uint_range(0, 1) == 1);
     } else {
-      m.args.push_back(osc::string_arg(m.address));
+      fe_add_string(m, address);
     }
   }
   return m;
 }
 
-TEST_CASE("[witness] every message round-trips and is word-aligned") {
-  witness::Generator<Message> gen = &gen_message;
-  std::function<bool(const Message &)> pred = [](const Message &m) {
-    std::vector<uint8_t> b = osc::encode(m);
-    Message back;
-    return b.size() % 4 == 0 && osc::decode(b.data(), b.size(), back) && back == m;
-  };
-  witness::Trial t = witness::resolve<Message>("osc round trip", gen, pred);
-  CHECK(t.outcome != witness::Outcome::FOUND);
+TEST(every_message_round_trips_word_aligned) {
+  CHECK(holds<fe_message>("osc round trip", &gen_message, [](const fe_message &p_m) {
+    uint8_t b[2048];
+    int n = fe_osc_encode(&p_m, b, sizeof b);
+    fe_message back;
+    return n > 0 && n % 4 == 0 && fe_osc_decode(b, n, &back) && fe_osc_equal(&back, &p_m);
+  }));
 }
 
-TEST_CASE("[witness] control: dropping the last byte is caught") {
-  witness::Generator<Message> gen = &gen_message;
-  std::function<bool(const Message &)> pred = [](const Message &m) {
-    std::vector<uint8_t> b = osc::encode(m);
-    Message back;
-    return osc::decode(b.data(), b.size() - 1, back) && back == m;
-  };
-  witness::Trial t = witness::resolve<Message>("truncated round trip", gen, pred);
-  CHECK(t.outcome == witness::Outcome::FOUND);
+TEST(control_dropping_the_last_byte_is_caught) {
+  CHECK(caught<fe_message>("truncated round trip", &gen_message, [](const fe_message &p_m) {
+    uint8_t b[2048];
+    int n = fe_osc_encode(&p_m, b, sizeof b);
+    fe_message back;
+    return fe_osc_decode(b, n - 1, &back) && fe_osc_equal(&back, &p_m);
+  }));
 }

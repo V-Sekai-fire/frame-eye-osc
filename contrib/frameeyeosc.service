@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 K. S. Ernest (iFire) Lee
+# SPDX-License-Identifier: MIT
 # systemd user unit. Install:
 #   mkdir -p ~/.config/systemd/user && cp contrib/frameeyeosc.service ~/.config/systemd/user/
 #   systemctl --user daemon-reload && systemctl --user enable --now frameeyeosc

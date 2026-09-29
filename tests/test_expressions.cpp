@@ -1,109 +1,111 @@
+// SPDX-FileCopyrightText: 2026 K. S. Ernest (iFire) Lee
 // SPDX-License-Identifier: MIT
-#include "expressions.hpp"
+#include "abi.h"
 
-#include "witness/doctest.h"
+#include "check.hpp"
+#include "witness_check.hpp"
 
-#include <cmath>
-#include <functional>
+static bool in01(float p_v) { return p_v >= 0.0f && p_v <= 1.0f; }
+static bool in_signed(float p_v) { return p_v >= -1.0f && p_v <= 1.0f; }
 
-using namespace frameeyeosc;
-
-static bool in01(float v) { return v >= 0.0f && v <= 1.0f; }
-static bool in_signed(float v) { return v >= -1.0f && v <= 1.0f; }
-
-static bool valid(const EyeOut &o) {
-  return in_signed(o.x) && in_signed(o.y) && in01(o.look_up) && in01(o.look_down) && in01(o.look_in) &&
-         in01(o.look_out) && in01(o.blink) && in01(o.openness) && in01(o.wide) && in01(o.squint) && in01(o.lid) &&
-         in01(o.cheek_squint) && in01(o.brow_lowerer) && in01(o.brow_pinch) && in01(o.brow_inner_up) &&
-         in01(o.brow_outer_up);
+static bool valid(const fe_eye_out &p_o) {
+  return in_signed(p_o.x) && in_signed(p_o.y) && in01(p_o.look_up) && in01(p_o.look_down) && in01(p_o.look_in) &&
+         in01(p_o.look_out) && in01(p_o.blink) && in01(p_o.openness) && in01(p_o.wide) && in01(p_o.squint) &&
+         in01(p_o.lid) && in01(p_o.cheek_squint) && in01(p_o.brow_lowerer) && in01(p_o.brow_pinch) &&
+         in01(p_o.brow_inner_up) && in01(p_o.brow_outer_up);
 }
 
 struct Case {
-  FrameIn in;
-  FrameCalib calib;
-  Gains gains;
+  fe_frame_in in;
+  fe_frame_calib calib;
+  fe_gains gains;
 };
 
-static float value(witness::RNG &rng, int lo, int hi) { return static_cast<float>(rng.int_range(lo, hi)) / 100.0f; }
+static float value(witness::RNG &p_rng, int p_lo, int p_hi) { return (float)p_rng.int_range(p_lo, p_hi) / 100.0f; }
 
-static Case gen_case(witness::RNG &rng, const witness::Level &) {
+static Case gen_case(witness::RNG &p_rng, const witness::Level &) {
   Case c;
-  c.in.left = EyeIn{value(rng, -50, 250), value(rng, -300, 300), value(rng, -300, 300)};
-  c.in.right = EyeIn{value(rng, -50, 250), value(rng, -300, 300), value(rng, -300, 300)};
-  c.calib.left = Calib{value(rng, -50, 100), value(rng, -50, 150), value(rng, -50, 200)};
-  c.calib.right = Calib{value(rng, -50, 100), value(rng, -50, 150), value(rng, -50, 200)};
-  c.gains = Gains{value(rng, -300, 300), value(rng, -300, 300), value(rng, -300, 300),
-                  value(rng, -300, 300), value(rng, -300, 300), value(rng, -300, 300)};
+  c.in.left = fe_eye_in{value(p_rng, -50, 250), value(p_rng, -300, 300), value(p_rng, -300, 300)};
+  c.in.right = fe_eye_in{value(p_rng, -50, 250), value(p_rng, -300, 300), value(p_rng, -300, 300)};
+  c.calib.left = fe_calib{value(p_rng, -50, 100), value(p_rng, -50, 150), value(p_rng, -50, 200)};
+  c.calib.right = fe_calib{value(p_rng, -50, 100), value(p_rng, -50, 150), value(p_rng, -50, 200)};
+  c.gains = fe_gains{value(p_rng, -300, 300), value(p_rng, -300, 300), value(p_rng, -300, 300),
+                     value(p_rng, -300, 300), value(p_rng, -300, 300), value(p_rng, -300, 300)};
   return c;
 }
 
-TEST_CASE("[witness] every weight is in range for any input, calibration and gains") {
-  witness::Generator<Case> gen = &gen_case;
-  std::function<bool(const Case &)> pred = [](const Case &c) {
-    FrameOut o = frame(c.gains, true, c.calib, c.in);
+TEST(every_weight_is_in_range) {
+  CHECK(holds<Case>("weights in range", &gen_case, [](const Case &p_c) {
+    fe_frame_out o = fe_frame(&p_c.gains, true, &p_c.calib, &p_c.in);
     return valid(o.left) && valid(o.right);
-  };
-  witness::Trial t = witness::resolve<Case>("weights in range", gen, pred);
-  CHECK(t.outcome != witness::Outcome::FOUND);
+  }));
 }
 
-TEST_CASE("[witness] an eye is never both closing and wide") {
-  witness::Generator<Case> gen = &gen_case;
-  std::function<bool(const Case &)> pred = [](const Case &c) {
-    return blink_of(c.calib.left, c.in.left.openness) == 0.0f || wide_of(c.calib.left, c.in.left.openness) == 0.0f;
-  };
-  witness::Trial t = witness::resolve<Case>("blink and wide exclusive", gen, pred);
-  CHECK(t.outcome != witness::Outcome::FOUND);
+TEST(an_eye_is_never_both_closing_and_wide) {
+  CHECK(holds<Case>("blink and wide exclusive", &gen_case, [](const Case &p_c) {
+    return fe_blink_of(&p_c.calib.left, p_c.in.left.openness) == 0.0f ||
+           fe_wide_of(&p_c.calib.left, p_c.in.left.openness) == 0.0f;
+  }));
 }
 
-TEST_CASE("[witness] mirroring the face mirrors every output") {
-  witness::Generator<Case> gen = &gen_case;
-  std::function<bool(const Case &)> pred = [](const Case &c) {
-    FrameCalib swapped{c.calib.right, c.calib.left};
-    FrameOut a = frame(c.gains, true, swapped, mirror(c.in));
-    FrameOut b = frame(c.gains, true, c.calib, c.in);
+TEST(mirroring_the_face_mirrors_every_output) {
+  CHECK(holds<Case>("mirror symmetry", &gen_case, [](const Case &p_c) {
+    fe_frame_calib swapped = {p_c.calib.right, p_c.calib.left};
+    fe_frame_in mirrored = fe_mirror(&p_c.in);
+    fe_frame_out a = fe_frame(&p_c.gains, true, &swapped, &mirrored);
+    fe_frame_out b = fe_frame(&p_c.gains, true, &p_c.calib, &p_c.in);
     return a.left.lid == b.right.lid && a.right.lid == b.left.lid && a.left.x == -b.right.x &&
            a.left.look_in == b.right.look_in && a.y == b.y;
-  };
-  witness::Trial t = witness::resolve<Case>("mirror symmetry", gen, pred);
-  CHECK(t.outcome != witness::Outcome::FOUND);
+  }));
 }
 
-TEST_CASE("[witness] control: an unmirrored face is caught") {
-  witness::Generator<Case> gen = &gen_case;
-  std::function<bool(const Case &)> pred = [](const Case &c) {
-    FrameOut a = frame(c.gains, true, c.calib, c.in);
+TEST(control_unequal_lids_are_caught) {
+  CHECK(caught<Case>("both lids always equal", &gen_case, [](const Case &p_c) {
+    fe_frame_out a = fe_frame(&p_c.gains, true, &p_c.calib, &p_c.in);
     return a.left.lid == a.right.lid;
-  };
-  witness::Trial t = witness::resolve<Case>("both lids always equal", gen, pred);
-  CHECK(t.outcome == witness::Outcome::FOUND);
+  }));
 }
 
-TEST_CASE("parallel gaze gives both eyes the same direction") {
-  FrameIn f;
-  f.left = EyeIn{0.8f, 0.3f, -0.1f};
-  f.right = EyeIn{0.8f, -0.2f, 0.4f};
-  FrameOut o = frame(Gains{}, true, FrameCalib{}, parallel(f));
+TEST(parallel_gaze_gives_both_eyes_the_same_direction) {
+  fe_frame_in f = {{0.8f, 0.3f, -0.1f}, {0.8f, -0.2f, 0.4f}};
+  fe_gains g = fe_gains_default();
+  fe_frame_calib c = fe_frame_calib_default();
+  fe_frame_in p = fe_parallel(&f);
+  fe_frame_out o = fe_frame(&g, true, &c, &p);
   CHECK(o.left.x == o.right.x);
   CHECK(o.left.y == o.right.y);
 }
 
-TEST_CASE("a normalized calibration is strictly ordered") {
-  Calib c = normalized(Calib{0.9f, 0.5f, 0.1f});
+TEST(normalized_calibration_is_strictly_ordered) {
+  fe_calib raw = {0.9f, 0.5f, 0.1f};
+  fe_calib c = fe_calib_normalized(&raw);
   CHECK(c.closed < c.neutral);
   CHECK(c.neutral < c.wide);
 }
 
-TEST_CASE("neutral follows open samples and ignores blinks") {
-  Calib c;
+TEST(neutral_follows_open_samples_and_ignores_blinks) {
+  fe_calib c = fe_calib_default();
   for (int k = 0; k < 5000; ++k) {
-    c = calib_step(c, k % 50 == 0 ? 0.0f : 0.9f);
+    c = fe_calib_step(&c, k % 50 == 0 ? 0.0f : 0.9f);
   }
-  CHECK(c.neutral == doctest::Approx(0.9f).epsilon(0.01));
+  CHECK(check::near(c.neutral, 0.9, 0.01));
 }
 
-TEST_CASE("relaxed open reads 0.75 on the lid, shut reads 0") {
-  Calib c;
-  CHECK(eye(Side::Left, Gains{}, true, c, EyeIn{0.75f, 0.0f, 0.0f}).lid == doctest::Approx(0.75f));
-  CHECK(eye(Side::Left, Gains{}, true, c, EyeIn{0.0f, 0.0f, 0.0f}).lid == 0.0f);
+TEST(relaxed_open_reads_three_quarters_on_the_lid) {
+  fe_calib c = fe_calib_default();
+  fe_gains g = fe_gains_default();
+  fe_eye_in relaxed = {0.75f, 0.0f, 0.0f};
+  fe_eye_in shut = {0.0f, 0.0f, 0.0f};
+  CHECK(check::near(fe_eye(0, &g, true, &c, &relaxed).lid, 0.75, 1e-6));
+  CHECK(fe_eye(0, &g, true, &c, &shut).lid == 0.0f);
+}
+
+TEST(calibration_saves_and_loads) {
+  fe_frame_calib c = {{0.1f, 0.7f, 0.95f}, {0.05f, 0.8f, 1.1f}};
+  fe_text path = fe_text_of("/tmp/frameeyeosc-calib-test.txt");
+  REQUIRE(fe_calib_save(&path, &c));
+  fe_frame_calib back = fe_frame_calib_default();
+  REQUIRE(fe_calib_load(&path, &back));
+  CHECK(check::near(back.right.wide, 1.1, 1e-5));
+  CHECK(check::near(back.left.neutral, 0.7, 1e-5));
 }

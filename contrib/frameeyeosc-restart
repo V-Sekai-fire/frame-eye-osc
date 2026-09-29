@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-FileCopyrightText: 2026 K. S. Ernest (iFire) Lee
 # SPDX-License-Identifier: MIT
 # Restart the frameeyeosc user service and say how it came back: the app behind
 # contrib/frameeyeosc.desktop. Touches only our own unit, never Valve's services.

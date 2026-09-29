@@ -6,9 +6,9 @@ Against what was suspected early on, the Steam Frame does also track eye opennes
 However, this data is only exposed in an internal shared-memory object (`/dev/shm/eye-server.mmap`), and not via any public APIs.
 This small headless program reads data sends it out via OSC as teh standard VRCFT parameters, with a configurable prefix.
 
-This is a C/C++ port of [konsti219/frameeyeosc](https://github.com/konsti219/frameeyeosc): the same shared-memory reader and the same per-eye OSC output. The Lean driver with calibration and anime-style eyes lives in [frame-eye-osc-lean](https://github.com/V-Sekai-fire/frame-eye-osc-lean).
+This is a port of [konsti219/frameeyeosc](https://github.com/konsti219/frameeyeosc) written in [Slang](https://shader-slang.org): the same shared-memory reader and the same per-eye OSC output. `slangc -target cpp` turns `src/*.slang` into C++, which calls libc through `__extern_cpp` declarations in `src/libc.slang`.
 
-On the headset, build with CMake and run:
+On the headset, with `slangc` on the path, build with CMake and run:
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFRAMEEYEOSC_BUILD_TESTS=OFF
@@ -16,7 +16,7 @@ cmake --build build
 ./build/frameeyeosc --target 127.0.0.1:9000
 ```
 
-Tests use doctest and witness-cpp, fetched at configure time:
+Tests are C++ with witness-cpp (vendored in `thirdparty/`, so nothing is fetched), against the functions `src/core.slang` exports:
 
 ```sh
 cmake -S . -B build && cmake --build build && ./build/frameeyeosc_tests

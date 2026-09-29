@@ -1,86 +1,100 @@
+// SPDX-FileCopyrightText: 2026 K. S. Ernest (iFire) Lee
 // SPDX-License-Identifier: MIT
-#include "anime.hpp"
+#include "abi.h"
 
-#include "witness/doctest.h"
+#include "check.hpp"
+#include "witness_check.hpp"
 
-#include <cmath>
-#include <functional>
-
-using namespace frameeyeosc;
-using namespace frameeyeosc::anime;
+#include <algorithm>
+#include <utility>
 
 // Half a second of steps at 90 Hz with a fixed relative openness per eye.
-static State hold(float rel_left, float rel_right) {
-  State s;
-  for (int k = 0; k < 45; ++k) {
-    s = step(Tuning{}, 11.0f, s, rel_left, rel_right);
+static fe_style_state hold(float p_rel_left, float p_rel_right) {
+  fe_tuning k = fe_tuning_default();
+  fe_style_state s = fe_style_state_default();
+  for (int i = 0; i < 45; ++i) {
+    s = fe_style_step(&k, 11.0f, &s, p_rel_left, p_rel_right);
   }
   return s;
 }
 
-TEST_CASE("a wink leaves a half-open eye open") {
-  State s = hold(0.0f, 0.4f);
-  CHECK(s.left.phase == Phase::Closed);
-  CHECK(s.right.phase == Phase::Opened);
+TEST(wink_leaves_a_half_open_eye_open) {
+  fe_style_state s = hold(0.0f, 0.4f);
+  CHECK(s.left.phase == FE_CLOSED);
+  CHECK(s.right.phase == FE_OPENED);
 }
 
-TEST_CASE("both eyes shut close both (control)") {
-  State s = hold(0.0f, 0.0f);
-  CHECK(s.left.phase == Phase::Closed);
-  CHECK(s.right.phase == Phase::Closed);
+TEST(control_both_eyes_shut_close_both) {
+  fe_style_state s = hold(0.0f, 0.0f);
+  CHECK(s.left.phase == FE_CLOSED);
+  CHECK(s.right.phase == FE_CLOSED);
 }
 
-TEST_CASE("a shut eye shows fully shut and an open eye fully open") {
-  EyeState closed;
-  closed.phase = Phase::Closed;
-  CHECK(level(Tuning{}, closed) == 0.0f);
-  CHECK(level(Tuning{}, EyeState{}) == 1.0f);
+TEST(shut_shows_shut_and_open_shows_open) {
+  fe_tuning k = fe_tuning_default();
+  fe_eye_state open = fe_eye_state_default();
+  fe_eye_state closed = fe_eye_state_default();
+  closed.phase = FE_CLOSED;
+  CHECK(fe_level(&k, &closed) == 0.0f);
+  CHECK(fe_level(&k, &open) == 1.0f);
 }
 
-TEST_CASE("an eye reopens after its reading rises past open_at") {
-  State s = hold(0.0f, 1.0f);
-  s = hold(1.0f, 1.0f);
-  CHECK(s.left.phase == Phase::Opened);
+TEST(an_eye_reopens_after_its_reading_rises) {
+  fe_tuning k = fe_tuning_default();
+  fe_style_state s = hold(0.0f, 1.0f);
+  for (int i = 0; i < 45; ++i) {
+    s = fe_style_step(&k, 11.0f, &s, 1.0f, 1.0f);
+  }
+  CHECK(s.left.phase == FE_OPENED);
 }
 
-TEST_CASE("the wink gate holds open only the eye the tracker still sees") {
-  std::array<float, 2> g = wink_gate(true, false, 0.1f, 0.2f);
-  CHECK(g[0] == 0.1f);
-  CHECK(g[1] == 1.0f);
-  g = wink_gate(false, true, 0.1f, 0.2f);
-  CHECK(g[0] == 1.0f);
-  CHECK(g[1] == 0.2f);
-  g = wink_gate(true, true, 0.1f, 0.2f);
-  CHECK(g[0] == 0.1f);
-  CHECK(g[1] == 0.2f);
+TEST(wink_gate_holds_open_only_the_seen_eye) {
+  float l = 0.1f;
+  float r = 0.2f;
+  fe_wink_gate(true, false, &l, &r);
+  CHECK(l == 0.1f);
+  CHECK(r == 1.0f);
+  l = 0.1f;
+  r = 0.2f;
+  fe_wink_gate(false, true, &l, &r);
+  CHECK(l == 1.0f);
+  CHECK(r == 0.2f);
+  l = 0.1f;
+  r = 0.2f;
+  fe_wink_gate(true, true, &l, &r);
+  CHECK(l == 0.1f);
+  CHECK(r == 0.2f);
 }
 
 struct StyleCase {
-  EyeState state;
+  fe_eye_state state;
   float raw;
   float look_down;
-  Calib calib;
+  fe_calib calib;
 };
 
-static StyleCase gen_style(witness::RNG &rng, const witness::Level &) {
+static StyleCase gen_style(witness::RNG &p_rng, const witness::Level &) {
   StyleCase c;
-  c.state.phase = static_cast<Phase>(rng.uint_range(0, 3));
-  c.state.t_ms = static_cast<float>(rng.uint_range(0, 500));
-  c.state.from = static_cast<float>(rng.int_range(-50, 150)) / 100.0f;
-  c.state.partial_ms = static_cast<float>(rng.uint_range(0, 2000));
-  c.raw = static_cast<float>(rng.int_range(-100, 300)) / 100.0f;
-  c.look_down = static_cast<float>(rng.int_range(0, 100)) / 100.0f;
-  c.calib = Calib{static_cast<float>(rng.int_range(-50, 100)) / 100.0f, static_cast<float>(rng.int_range(-50, 150)) / 100.0f,
-                  static_cast<float>(rng.int_range(-50, 200)) / 100.0f};
+  c.state.phase = (int32_t)p_rng.uint_range(0, 3);
+  c.state.t_ms = (float)p_rng.uint_range(0, 500);
+  c.state.from = (float)p_rng.int_range(-50, 150) / 100.0f;
+  c.state.partial_ms = (float)p_rng.uint_range(0, 2000);
+  c.raw = (float)p_rng.int_range(-100, 300) / 100.0f;
+  c.look_down = (float)p_rng.int_range(0, 100) / 100.0f;
+  c.calib = fe_calib{(float)p_rng.int_range(-50, 100) / 100.0f, (float)p_rng.int_range(-50, 150) / 100.0f,
+                     (float)p_rng.int_range(-50, 200) / 100.0f};
   return c;
 }
 
-TEST_CASE("[witness] the anime layer keeps every channel in 0..1") {
-  witness::Generator<StyleCase> gen = &gen_style;
-  std::function<bool(const StyleCase &)> pred = [](const StyleCase &c) {
-    EyeOut base;
-    base.look_down = c.look_down;
-    EyeOut o = style_eye(Tuning{}, Gains{}, true, c.calib, c.raw, c.state, base);
+TEST(anime_layer_keeps_every_channel_in_range) {
+  CHECK(holds<StyleCase>("style in range", &gen_style, [](const StyleCase &p_c) {
+    fe_tuning k = fe_tuning_default();
+    fe_gains g = fe_gains_default();
+    fe_calib c = fe_calib_default();
+    fe_eye_in e = {0.75f, 0.0f, 0.0f};
+    fe_eye_out base = fe_eye(0, &g, true, &c, &e);
+    base.look_down = p_c.look_down;
+    fe_eye_out o = fe_style_eye(&k, &g, true, &p_c.calib, p_c.raw, &p_c.state, &base);
     const float vs[] = {o.blink, o.openness, o.wide, o.squint, o.lid, o.cheek_squint, o.brow_lowerer,
                         o.brow_pinch, o.brow_inner_up, o.brow_outer_up};
     for (float v : vs) {
@@ -89,52 +103,46 @@ TEST_CASE("[witness] the anime layer keeps every channel in 0..1") {
       }
     }
     return true;
-  };
-  witness::Trial t = witness::resolve<StyleCase>("style in range", gen, pred);
-  CHECK(t.outcome != witness::Outcome::FOUND);
+  }));
 }
 
-static std::pair<int, int> gen_pair(witness::RNG &rng, const witness::Level &) {
-  return {rng.int_range(-900, 900), rng.int_range(-900, 900)};
+static std::pair<int, int> gen_pair(witness::RNG &p_rng, const witness::Level &) {
+  return {p_rng.int_range(-900, 900), p_rng.int_range(-900, 900)};
 }
 
-TEST_CASE("[witness] expressive gaze is odd, bounded and never reverses") {
-  witness::Generator<std::pair<int, int>> gen = &gen_pair;
-  std::function<bool(const std::pair<int, int> &)> pred = [](const std::pair<int, int> &p) {
-    float a = static_cast<float>(std::min(p.first, p.second)) / 10.0f;
-    float b = static_cast<float>(std::max(p.first, p.second)) / 10.0f;
-    float ea = expressive(1.8f, 30.0f, 1.5f, a);
-    float eb = expressive(1.8f, 30.0f, 1.5f, b);
-    return ea == -expressive(1.8f, 30.0f, 1.5f, -a) && std::fabs(ea) <= 30.0f && ea <= eb;
-  };
-  witness::Trial t = witness::resolve<std::pair<int, int>>("expressive gaze", gen, pred);
-  CHECK(t.outcome != witness::Outcome::FOUND);
+TEST(expressive_gaze_is_odd_bounded_and_monotone) {
+  CHECK(holds<std::pair<int, int>>("expressive gaze", &gen_pair, [](const std::pair<int, int> &p_p) {
+    float a = (float)std::min(p_p.first, p_p.second) / 10.0f;
+    float b = (float)std::max(p_p.first, p_p.second) / 10.0f;
+    float ea = fe_expressive(1.8f, 30.0f, 1.5f, a);
+    float eb = fe_expressive(1.8f, 30.0f, 1.5f, b);
+    return ea == -fe_expressive(1.8f, 30.0f, 1.5f, -a) && std::fabs(ea) <= 30.0f && ea <= eb;
+  }));
 }
 
-TEST_CASE("[witness] control: a gain without the tanh limit is caught") {
-  witness::Generator<std::pair<int, int>> gen = &gen_pair;
-  std::function<bool(const std::pair<int, int> &)> pred = [](const std::pair<int, int> &p) {
-    return std::fabs(1.8f * static_cast<float>(p.first) / 10.0f) <= 30.0f;
-  };
-  witness::Trial t = witness::resolve<std::pair<int, int>>("unlimited gaze bounded", gen, pred);
-  CHECK(t.outcome == witness::Outcome::FOUND);
+TEST(control_gain_without_limit_is_caught) {
+  CHECK(caught<std::pair<int, int>>("unlimited gaze bounded", &gen_pair, [](const std::pair<int, int> &p_p) {
+    return std::fabs(1.8f * (float)p_p.first / 10.0f) <= 30.0f;
+  }));
 }
 
-TEST_CASE("the One Euro filter holds still at rest and reaches a saccade") {
-  OneEuro f;
+TEST(one_euro_holds_still_and_reaches_a_saccade) {
+  fe_one_euro f = {0.0f, 0.0f, false};
   for (int k = 0; k < 90; ++k) {
-    f = one_euro_step(f, 0.0f, 0.011f);
+    f = fe_one_euro_step(&f, 0.0f, 0.011f);
   }
   CHECK(f.x == 0.0f);
   for (int k = 0; k < 9; ++k) {
-    f = one_euro_step(f, 20.0f, 0.011f);
+    f = fe_one_euro_step(&f, 20.0f, 0.011f);
   }
   CHECK(f.x > 15.0f);
 }
 
-TEST_CASE("pitch is positive looking down, yaw positive looking right") {
-  const float down_right[3] = {0.3f, -0.3f, -1.0f};
-  std::array<float, 2> py = pitch_yaw_degrees(down_right);
-  CHECK(py[0] > 0.0f);
-  CHECK(py[1] > 0.0f);
+TEST(pitch_positive_down_yaw_positive_right) {
+  const fe_vec3 down_right = {0.3f, -0.3f, -1.0f};
+  float pitch = 0.0f;
+  float yaw = 0.0f;
+  fe_pitch_yaw_degrees(&down_right, &pitch, &yaw);
+  CHECK(pitch > 0.0f);
+  CHECK(yaw > 0.0f);
 }
