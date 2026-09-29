@@ -26,7 +26,7 @@ By default both eyes get the same combined gaze, on the native path and in `FT/v
 
 Each name is sent as `FT/v2/…`, `v2/…` or the v1 names, as a float or bit-packed
 (`Name1/2/4…` plus `NameNegative`), whichever the current avatar actually has. The avatar
-is read from VRChat's OSCQuery. `EyeTrackingActive` is left to the avatar's menu toggle. The
+is read from VRChat's OSCQuery. `EyeTrackingActive` is set while samples flow. The
 Frame has no face cameras, so mouth, jaw and tongue shapes are never sent.
 
 ## Install (on the Frame)
