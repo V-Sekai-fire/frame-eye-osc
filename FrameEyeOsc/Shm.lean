@@ -30,6 +30,7 @@ structure EyeSample where
   gaze : Array (Float × Float × Float)      -- [left, right], unit vectors, -Z forward
   fixation : Float × Float × Float
   preFusionGaze : Array (Float × Float × Float)
+  gazeCov : Array Float                     -- [left xyz, right xyz] gaze covariance diagonal
   openness : Array Float                    -- [left, right]
   extra : Array Float                       -- 8 floats, not yet identified
   deriving Repr, Inhabited
@@ -43,6 +44,7 @@ def decode (b : ByteArray) : Option EyeSample :=
     gaze := #[vec3 b (at_ "gaze_direction"), vec3 b (at_ "gaze_direction" + 12)]
     fixation := vec3 b (at_ "fixation_point")
     preFusionGaze := #[vec3 b (at_ "pre_fusion_gaze"), vec3 b (at_ "pre_fusion_gaze" + 12)]
+    gazeCov := (List.range 6).toArray.map fun k => f32le b (at_ "gaze_covariance_diag" + 4 * k)
     openness := #[f32le b (at_ "openness"), f32le b (at_ "openness" + 4)]
     extra := (List.range 8).toArray.map fun k => f32le b (at_ "estimate_extra" + 4 * k) }
 
@@ -84,6 +86,11 @@ def expressive (gain limit dead a : Float) : Float :=
   if m ≤ 0.0 || limit ≤ 0.0 then 0.0 else
     let v := limit * Float.tanh (gain * m / limit)
     if a < 0.0 then -v else v
+
+/-- The tracker has lost this eye: its gaze covariance jumps when the lid covers it. -/
+def occluded (at_ : Float) (s : EyeSample) (i : Nat) : Bool :=
+  let c (k : Nat) := s.gazeCov.getD (3 * i + k) 0.0
+  max (c 0) (max (c 1) (c 2)) > at_
 
 /-- Eyes-shut evidence: the sum of `estimate_extra[4..7]`. In spoken-cue recordings it
 sits near 0.002 with eyes open and near 0.014 held shut, a ~7× gap (AUC ≈ 0.98), while

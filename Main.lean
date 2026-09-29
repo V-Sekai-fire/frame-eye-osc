@@ -26,10 +26,11 @@ structure Cli where
   anime : Bool := true                        -- --style anime (default): eyes rebuilt clean from raw values
   traceCap : Nat := 16384                    -- --trace ring size (~3 min at 90 Hz)
   trace : Option String := none                -- ring of per-sample lines (sent values, raw openness, blink phase), rewritten each second
+  winkCov : Option Float := some 0.02         -- gaze covariance above which an eye counts as lost (--no-wink-gate)
   closureExtras : Bool := true               -- detect held-shut eyes from estimate_extra[4..7] (--closure openness to disable)
   learnPort : UInt16 := 9001                   -- VRChat's OSC output (--osc=9000:<frame-ip>:9001); 0 = off
 
-def usage : String := "usage: frameeyeosc [--target HOST:PORT] [--prefix FT/] [--no-heuristics] [--no-native] [--native-blink] [--style anime|raw] [--vergence] [--gaze-gain PCT] [--gaze-max DEG] [--smooth PCT] [--learn-port 9001] [--dump] [--gains FILE]
+def usage : String := "usage: frameeyeosc [--target HOST:PORT] [--prefix FT/] [--no-heuristics] [--no-native] [--no-wink-gate] [--native-blink] [--style anime|raw] [--vergence] [--gaze-gain PCT] [--gaze-max DEG] [--smooth PCT] [--learn-port 9001] [--dump] [--gains FILE]
   With no --target, VRChat is found over mDNS/OSCQuery and only the current avatar's
   parameters are sent. With --target, parameters are learned from VRChat's OSC output
   (launch VRChat with --osc=9000:<frame-ip>:9001); until then every v2 float is sent."
@@ -47,6 +48,7 @@ def parseCli : List String → Cli → Except String Cli
     parseCli rest { c with prefix_ := if p.isEmpty || p.endsWith "/" then p else p ++ "/" }
   | "--no-heuristics" :: rest, c => parseCli rest { c with heuristics := false }
   | "--no-native" :: rest, c => parseCli rest { c with native := false }
+  | "--no-wink-gate" :: rest, c => parseCli rest { c with winkCov := none }
   | "--trace-cap" :: n :: rest, c => parseCli rest { c with traceCap := n.toNat?.getD c.traceCap }
   | "--trace" :: f :: rest, c => parseCli rest { c with trace := some f }
   | "--closure" :: "extras" :: rest, c => parseCli rest { c with closureExtras := true }
@@ -67,12 +69,11 @@ def parseCli : List String → Cli → Except String Cli
   | "--source" :: f :: rest, c => parseCli rest { c with source := f }
   | a :: _, _ => .error s!"unknown argument {a}\n{usage}"
 
-/-- Where to send and what. `active` is the avatar's EyeTrackingActive bools. -/
+/-- Where to send and what. EyeTrackingActive is the avatar menu's toggle and is never sent. -/
 structure Route where
   ip : String
   port : UInt16
   entries : List Entry
-  active : List String
 
 /-- One Euro filter (Casiez et al. 2012): steady at rest, fast on a saccade. -/
 structure OneEuro where
@@ -106,9 +107,7 @@ partial def discoveryLoop (route : IO.Ref (Option Route)) (avatar : Option Strin
         if id != avatar || (← route.get).isNone then
           let ps ← Discovery.avatarParameters v
           let entries := plan ps
-          let active := ps.filterMap fun (p, t) =>
-            if p.endsWith "EyeTrackingActive" && t != "f" then some p else none
-          route.set (some { ip := v.oscIp, port := v.oscPort, entries, active })
+          route.set (some { ip := v.oscIp, port := v.oscPort, entries })
           log s!"VRChat at {v.oscIp}:{v.oscPort} (OSCQuery {v.httpIp}:{v.httpPort}), avatar {id.getD "?"}: {entries.length} of {ps.length} parameters driven"
         pure id
     catch e =>
@@ -152,8 +151,7 @@ lost over Wi-Fi), and an avatar must never end up driven by nothing. -/
 def routeFor (ip : String) (port : UInt16) (pre : String) (ps : List (String × String)) : Route :=
   let learned := plan ps
   let extra := (fallbackPlan pre).filter fun e => !learned.any (·.address == e.address)
-  { ip, port, entries := learned ++ extra
-    active := ps.filterMap fun (p, t) => if p.endsWith "EyeTrackingActive" && t != "f" then some p else none }
+  { ip, port, entries := learned ++ extra }
 
 def oscOf (address : String) : Value → Osc.Message
   | .float q => { address, args := [.f (toFloat q)] }
@@ -174,8 +172,7 @@ def main (args : List String) : IO UInt32 := do
   let route ← IO.mkRef (none : Option Route)
   match cli.target with
   | some (ip, port) =>
-    route.set (some { ip, port, entries := fallbackPlan cli.prefix_,
-                      active := [s!"{paramsPrefix}{cli.prefix_}EyeTrackingActive"] })
+    route.set (some { ip, port, entries := fallbackPlan cli.prefix_ })
     log s!"sending to {ip}:{port}; every v2 float until the avatar's parameters are learned"
   | none =>
     let _ ← IO.asTask (prio := .dedicated) (discoveryLoop route none)
@@ -226,7 +223,6 @@ def main (args : List String) : IO UInt32 := do
   let sock ← Ffi.udpOpen 0 0
   let mut calib ← Calib.load
   let mut last : Std.HashMap String Value := {}
-  let mut active := false
   let mut n : Nat := 0
   let mut lastSave ← IO.monoMsNow
   let mut lastRefresh ← IO.monoMsNow
@@ -287,7 +283,7 @@ def main (args : List String) : IO UInt32 := do
       else if changedAt != 0 && now - changedAt ≥ 300 then
         changedAt := 0
         let ps := st.list
-        let fallback : Route := ⟨ip, port, fallbackPlan cli.prefix_, [s!"{paramsPrefix}{cli.prefix_}EyeTrackingActive"]⟩
+        let fallback : Route := ⟨ip, port, fallbackPlan cli.prefix_⟩
         let r := if ps.isEmpty then fallback else routeFor ip port cli.prefix_ ps
         route.set (some r)
         last := {}
@@ -316,6 +312,9 @@ def main (args : List String) : IO UInt32 := do
             shut := if shut then sc > 0.004 else sc > 0.008
           let (rl, rr) := if shut then (0, 0)
             else (Anime.rel calib.left input.left.openness, Anime.rel calib.right input.right.openness)
+          let (rl, rr) := match cli.winkCov with
+            | some c => Anime.winkGate (Shm.occluded c s 0) (Shm.occluded c s 1) rl rr
+            | none => (rl, rr)
           animeSt := Anime.step tuning (dtS * 1000.0).toUInt64.toNat animeSt rl rr
           let out := Anime.styleFrame tuning gains cli.heuristics calib input animeSt (frame gains cli.heuristics calib input)
           pure (input, out)
@@ -378,9 +377,6 @@ def main (args : List String) : IO UInt32 := do
             closedS := closedS + (if target > closedS then 0.8 else 0.4) * (target - closedS)
           let closedMsg : Osc.Message := ⟨"/tracking/eye/EyesClosedAmount", [.f closedS]⟩
           Ffi.udpSend sock r.ip r.port (Osc.encode closedMsg)
-      if !active || refresh then
-        for a in r.active do Ffi.udpSend sock r.ip r.port (Osc.encode (oscOf a (.bool true)))
-      active := true
       if now - lastSave > 60000 then
         try Calib.save calib catch e => log s!"saving calibration: {e}"
         lastSave := now
@@ -406,9 +402,6 @@ def main (args : List String) : IO UInt32 := do
       if now - lastSampleAt > 1000 then
         shut := false            -- a stale "shut" must not outlive the data it came from
         animeSt := {}
-      if active && now - lastSampleAt > 1000 then
-        for a in r.active do Ffi.udpSend sock r.ip r.port (Osc.encode (oscOf a (.bool false)))
-        active := false
     | some s, none =>
       if cli.dump && n % 24 == 0 then
         IO.println s!"(no VRChat yet) t={s.time} open={s.openness} gaze={s.gaze} extra={s.extra}"
