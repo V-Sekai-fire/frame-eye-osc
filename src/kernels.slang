@@ -342,7 +342,7 @@ float alpha(float p_cutoff_hz, float p_dt_s) {
   return 1.0 / (1.0 + tau / p_dt_s);
 }
 
-// One Euro filter: steady at rest, fast on a saccade.
+// One Euro filter (Casiez et al. 2012, doi 10.1145/2207676.2208639): steady at rest, fast on a saccade.
 public export __extern_cpp OneEuro fe_one_euro_step(OneEuro p_f, float p_value, float p_dt_s) {
   OneEuro n;
   if (!p_f.primed || p_dt_s <= 0.0) {
