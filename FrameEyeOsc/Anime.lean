@@ -93,6 +93,14 @@ def winkGate (occL occR : Bool) (rl rr : Int) : Int × Int :=
   else if occR && !occL then (max rl unit, rr)
   else (rl, rr)
 
+/-- Per-eye openness the style layer steps: a held-shut face closes both, then the wink
+gate reopens the eye the tracker still sees. -/
+def eyesIn (shut : Bool) (occ : Option (Bool × Bool)) (rl rr : Int) : Int × Int :=
+  let (rl, rr) := if shut then (0, 0) else (rl, rr)
+  match occ with
+  | some (l, r) => winkGate l r rl rr
+  | none => (rl, rr)
+
 /-- Unless exactly one eye is lost, both readings pass through: a blink stays a blink. -/
 theorem winkGate_same (o : Bool) (rl rr : Int) : winkGate o o rl rr = (rl, rr) := by
   cases o <;> rfl

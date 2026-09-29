@@ -96,6 +96,28 @@ def learnOk : Bool :=
   let names (es : List Params.Entry) := (es.map (·.address)).mergeSort (· ≤ ·)
   st.avatar == some "avtr_test" && names (Params.plan st.list) == names (Params.plan avatar)
 
+/-- Half a second of anime-style steps at 90 Hz with fixed relative openness per eye. -/
+def hold (rl rr : Int) : Anime.State :=
+  (List.range 45).foldl (fun st _ => Anime.step {} 11 st rl rr) {}
+
+/-- A synthetic eye-server record: per-eye openness and gaze covariance, and the four
+estimate_extra values the held-shut score sums. -/
+def synth (ol orr cl cr ex : Float) : Shm.EyeSample :=
+  (Shm.decode (recordBytes 1 0.0 ([0, 0, -1, 0, 0, -1, cl, cl, cl, cr, cr, cr, 0, 0, -1,
+    0, 0, -1, 0, 0, -1, 0, 0, 0, 0, 0, 0, ol, orr, 0, 0, 0, 0, ex, ex, ex, ex]))).get!
+
+/-- What the driver steps for a record: held-shut from the extras, then the wink gate. -/
+def driverIn (s : Shm.EyeSample) : Int × Int :=
+  let rel (o : Float) := ofFloat o
+  Anime.eyesIn (Shm.shutScore s > 0.008) (some (Shm.occluded 0.02 s 0, Shm.occluded 0.02 s 1))
+    (rel s.openness[0]!) (rel s.openness[1]!)
+
+/-- Lid state after half a second of one synthetic record, as (left shut, right shut). -/
+def shutAfter (s : Shm.EyeSample) : Bool × Bool :=
+  let (rl, rr) := driverIn s
+  let st := hold rl rr
+  (st.left.phase == .closed, st.right.phase == .closed)
+
 def unitChecks : List (String × Bool) :=
   let p := Params.plan avatar
   let widthOf (a : String) := p.findSome? fun e =>
@@ -116,7 +138,18 @@ def unitChecks : List (String × Bool) :=
         [{ instance_ := inst, ip := "192.168.1.50", port := 50123 }]),
     ("a #bundle of three messages decodes to all three", bundleOk),
     ("learning from VRChat's output builds the same plan as OSCQuery", learnOk),
-    ("DNS query parses back as zero records", (Dns.parse (Dns.query "_oscjson._tcp.local" Dns.typePTR)).isEmpty) ]
+    ("DNS query parses back as zero records", (Dns.parse (Dns.query "_oscjson._tcp.local" Dns.typePTR)).isEmpty),
+    ("a wink leaves a half-open eye open", (hold 0 4000).left.phase == .closed && (hold 0 4000).right.phase == .opened),
+    ("both eyes shut close both (control)", (hold 0 0).left.phase == .closed && (hold 0 0).right.phase == .closed),
+    ("synthetic record decodes its openness and covariance",
+      (synth 0.25 0.75 0.05 0.001 0.0005).openness == #[0.25, 0.75] && Shm.occluded 0.02 (synth 0.25 0.75 0.05 0.001 0.0005) 0),
+    ("driver: clean left wink shuts only the left eye", shutAfter (synth 0.05 1.0 0.001 0.001 0.0005) == (true, false)),
+    ("driver: clean right wink shuts only the right eye", shutAfter (synth 1.0 0.05 0.001 0.001 0.0005) == (false, true)),
+    ("driver: held-shut left wink with the left eye lost shuts only the left", shutAfter (synth 0.10 0.15 0.05 0.001 0.0035) == (true, false)),
+    ("driver: held-shut right wink with the right eye lost shuts only the right", shutAfter (synth 0.15 0.10 0.001 0.05 0.0035) == (false, true)),
+    ("driver: flat openness, left eye lost, shuts only the left", shutAfter (synth 1.0 1.0 0.05 0.001 0.0035) == (true, false)),
+    ("driver: blink with both eyes lost shuts both (control)", shutAfter (synth 0.05 0.05 0.05 0.05 0.0035) == (true, true)),
+    ("driver: open eyes stay open (control)", shutAfter (synth 1.0 1.0 0.001 0.001 0.0005) == (false, false)) ]
 
 def main : IO UInt32 := do
   let mut bad := 0

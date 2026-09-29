@@ -310,11 +310,8 @@ def main (args : List String) : IO UInt32 := do
           if cli.closureExtras then
             let sc := Shm.shutScore s
             shut := if shut then sc > 0.004 else sc > 0.008
-          let (rl, rr) := if shut then (0, 0)
-            else (Anime.rel calib.left input.left.openness, Anime.rel calib.right input.right.openness)
-          let (rl, rr) := match cli.winkCov with
-            | some c => Anime.winkGate (Shm.occluded c s 0) (Shm.occluded c s 1) rl rr
-            | none => (rl, rr)
+          let (rl, rr) := Anime.eyesIn shut (cli.winkCov.map fun c => (Shm.occluded c s 0, Shm.occluded c s 1))
+            (Anime.rel calib.left input.left.openness) (Anime.rel calib.right input.right.openness)
           animeSt := Anime.step tuning (dtS * 1000.0).toUInt64.toNat animeSt rl rr
           let out := Anime.styleFrame tuning gains cli.heuristics calib input animeSt (frame gains cli.heuristics calib input)
           pure (input, out)
@@ -368,7 +365,8 @@ def main (args : List String) : IO UInt32 := do
             IO.FS.writeFile (f ++ ".tmp") ("\n".intercalate traceRing.toList ++ "\n")
             IO.FS.rename (f ++ ".tmp") f
         if cli.nativeBlink then
-          let b := toFloat (clamp01 ((out.left.blink + out.right.blink) / 2))
+          -- one value drives both lids, so it shuts only when both eyes do; winks go through EyeLid*
+          let b := toFloat (clamp01 (min out.left.blink out.right.blink))
           if cli.anime then
             closedS := b     -- already a clean blink curve
           else
