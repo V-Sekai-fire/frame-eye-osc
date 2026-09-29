@@ -1,0 +1,11 @@
+version = 1
+
+[[annotations]]
+path = ["README.md", ".gitignore", "REUSE.toml"]
+SPDX-FileCopyrightText = ["2026 K. S. Ernest (iFire) Lee", "2026 konsti219"]
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["thirdparty/witness-cpp/LICENSE", "thirdparty/witness-cpp/README.md"]
+SPDX-FileCopyrightText = "2026 K. S. Ernest (iFire) Lee"
+SPDX-License-Identifier = "MIT"

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 K. S. Ernest (iFire) Lee
+# SPDX-License-Identifier: MIT
 # systemd user unit. Install:
 #   mkdir -p ~/.config/systemd/user && cp contrib/frameeyeosc.service ~/.config/systemd/user/
 #   systemctl --user daemon-reload && systemctl --user enable --now frameeyeosc
@@ -7,11 +9,10 @@ After=graphical-session.target
 
 [Service]
 WorkingDirectory=%h/frameeyeosc
-# With no arguments it finds VRChat over mDNS/OSCQuery. VRChat's OSCQuery HTTP server
-# only listens on 127.0.0.1, so for VRChat on a PC pass its address instead, e.g. via
+# With no arguments it sends to 127.0.0.1:9000. For VRChat on a PC pass its address, e.g. via
 #   systemctl --user edit frameeyeosc   ->  Environment="FRAMEEYEOSC_ARGS=--target 192.168.1.229:9000"
 Environment=FRAMEEYEOSC_ARGS=
-ExecStart=%h/frameeyeosc/.lake/build/bin/frameeyeosc $FRAMEEYEOSC_ARGS
+ExecStart=%h/frameeyeosc/build/frameeyeosc $FRAMEEYEOSC_ARGS
 Restart=always
 RestartSec=3
 

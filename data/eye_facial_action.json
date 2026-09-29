@@ -1,9 +1,0 @@
-{
-  "_comment": "Eye-only co-activation gains over the 52 facial-action blendshape labels anny carries (anny/src/anny/models/facial_actions.py). Each value scales the source weight; 1.0 passes it through. Every output is clamped to [0, 1] whatever these are (FrameEyeOsc.Expressions.eye_valid).",
-  "eyeSquint_from_partial_closure": 1.0,
-  "cheekSquint_from_eyeSquint": 0.6,
-  "browDown_from_eyeSquint": 0.5,
-  "browPinch_from_eyeSquint": 0.3,
-  "browInnerUp_from_eyeWide": 0.7,
-  "browOuterUp_from_eyeWide": 0.8
-}
