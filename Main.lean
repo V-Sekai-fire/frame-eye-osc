@@ -67,11 +67,12 @@ def parseCli : List String → Cli → Except String Cli
   | "--source" :: f :: rest, c => parseCli rest { c with source := f }
   | a :: _, _ => .error s!"unknown argument {a}\n{usage}"
 
-/-- Where to send and what. EyeTrackingActive is the avatar menu's toggle and is never sent. -/
+/-- Where to send and what. `active` is the avatar's EyeTrackingActive bools. -/
 structure Route where
   ip : String
   port : UInt16
   entries : List Entry
+  active : List String
 
 /-- One Euro filter (Casiez et al. 2012): steady at rest, fast on a saccade. -/
 structure OneEuro where
@@ -105,7 +106,9 @@ partial def discoveryLoop (route : IO.Ref (Option Route)) (avatar : Option Strin
         if id != avatar || (← route.get).isNone then
           let ps ← Discovery.avatarParameters v
           let entries := plan ps
-          route.set (some { ip := v.oscIp, port := v.oscPort, entries })
+          let active := ps.filterMap fun (p, t) =>
+            if p.endsWith "EyeTrackingActive" && t != "f" then some p else none
+          route.set (some { ip := v.oscIp, port := v.oscPort, entries, active })
           log s!"VRChat at {v.oscIp}:{v.oscPort} (OSCQuery {v.httpIp}:{v.httpPort}), avatar {id.getD "?"}: {entries.length} of {ps.length} parameters driven"
         pure id
     catch e =>
@@ -149,7 +152,8 @@ lost over Wi-Fi), and an avatar must never end up driven by nothing. -/
 def routeFor (ip : String) (port : UInt16) (pre : String) (ps : List (String × String)) : Route :=
   let learned := plan ps
   let extra := (fallbackPlan pre).filter fun e => !learned.any (·.address == e.address)
-  { ip, port, entries := learned ++ extra }
+  { ip, port, entries := learned ++ extra
+    active := ps.filterMap fun (p, t) => if p.endsWith "EyeTrackingActive" && t != "f" then some p else none }
 
 def oscOf (address : String) : Value → Osc.Message
   | .float q => { address, args := [.f (toFloat q)] }
@@ -170,7 +174,8 @@ def main (args : List String) : IO UInt32 := do
   let route ← IO.mkRef (none : Option Route)
   match cli.target with
   | some (ip, port) =>
-    route.set (some { ip, port, entries := fallbackPlan cli.prefix_ })
+    route.set (some { ip, port, entries := fallbackPlan cli.prefix_,
+                      active := [s!"{paramsPrefix}{cli.prefix_}EyeTrackingActive"] })
     log s!"sending to {ip}:{port}; every v2 float until the avatar's parameters are learned"
   | none =>
     let _ ← IO.asTask (prio := .dedicated) (discoveryLoop route none)
@@ -221,6 +226,7 @@ def main (args : List String) : IO UInt32 := do
   let sock ← Ffi.udpOpen 0 0
   let mut calib ← Calib.load
   let mut last : Std.HashMap String Value := {}
+  let mut active := false
   let mut n : Nat := 0
   let mut lastSave ← IO.monoMsNow
   let mut lastRefresh ← IO.monoMsNow
@@ -281,7 +287,7 @@ def main (args : List String) : IO UInt32 := do
       else if changedAt != 0 && now - changedAt ≥ 300 then
         changedAt := 0
         let ps := st.list
-        let fallback : Route := ⟨ip, port, fallbackPlan cli.prefix_⟩
+        let fallback : Route := ⟨ip, port, fallbackPlan cli.prefix_, [s!"{paramsPrefix}{cli.prefix_}EyeTrackingActive"]⟩
         let r := if ps.isEmpty then fallback else routeFor ip port cli.prefix_ ps
         route.set (some r)
         last := {}
@@ -372,6 +378,9 @@ def main (args : List String) : IO UInt32 := do
             closedS := closedS + (if target > closedS then 0.8 else 0.4) * (target - closedS)
           let closedMsg : Osc.Message := ⟨"/tracking/eye/EyesClosedAmount", [.f closedS]⟩
           Ffi.udpSend sock r.ip r.port (Osc.encode closedMsg)
+      if !active || refresh then
+        for a in r.active do Ffi.udpSend sock r.ip r.port (Osc.encode (oscOf a (.bool true)))
+      active := true
       if now - lastSave > 60000 then
         try Calib.save calib catch e => log s!"saving calibration: {e}"
         lastSave := now
@@ -397,6 +406,9 @@ def main (args : List String) : IO UInt32 := do
       if now - lastSampleAt > 1000 then
         shut := false            -- a stale "shut" must not outlive the data it came from
         animeSt := {}
+      if active && now - lastSampleAt > 1000 then
+        for a in r.active do Ffi.udpSend sock r.ip r.port (Osc.encode (oscOf a (.bool false)))
+        active := false
     | some s, none =>
       if cli.dump && n % 24 == 0 then
         IO.println s!"(no VRChat yet) t={s.time} open={s.openness} gaze={s.gaze} extra={s.extra}"
