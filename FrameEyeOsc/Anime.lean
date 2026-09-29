@@ -90,6 +90,27 @@ def stepEye (k : Tuning) (dt : Nat) (s : EyeState) (r : Int) : EyeState :=
 
 def closingish (s : EyeState) : Bool := s.phase == .closing || s.phase == .closed
 
+/-- A wink the fused openness misses. The tracker reports both lids shut during a wink,
+but only the closed eye loses its gaze fix; the eye it still sees is held open. -/
+def winkGate (occL occR : Bool) (rl rr : Int) : Int × Int :=
+  if occL && !occR then (rl, max rr unit)
+  else if occR && !occL then (max rl unit, rr)
+  else (rl, rr)
+
+/-- Unless exactly one eye is lost, both readings pass through: a blink stays a blink. -/
+theorem winkGate_same (o : Bool) (rl rr : Int) : winkGate o o rl rr = (rl, rr) := by
+  cases o <;> rfl
+
+/-- The eye the tracker lost always keeps its own reading. -/
+theorem winkGate_keeps_lost (rl rr : Int) :
+    (winkGate true false rl rr).1 = rl ∧ (winkGate false true rl rr).2 = rr := by
+  simp [winkGate]
+
+/-- The eye it still sees is never shown more closed than relaxed-open. -/
+theorem winkGate_opens_seen (rl rr : Int) :
+    unit ≤ (winkGate true false rl rr).2 ∧ unit ≤ (winkGate false true rl rr).1 := by
+  simp [winkGate]; omega
+
 /-- Step both eyes, then link them: a blink pulls the other eye along unless it is clearly open. -/
 def step (k : Tuning) (dt : Nat) (st : State) (rl rr : Int) : State :=
   let l := stepEye k dt st.left rl
