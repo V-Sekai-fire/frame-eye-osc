@@ -3,7 +3,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstring>
 #include <utility>
 
 namespace frameeyeosc {
@@ -45,11 +44,11 @@ static std::string base(const std::string &prefix) {
   return "/avatar/parameters" + p;
 }
 
-Message tracking_active(const std::string &prefix, bool active) {
-  return Message{base(prefix) + "/EyeTrackingActive", Message::Kind::Bool, 0.0f, active};
+osc::Message tracking_active(const std::string &prefix, bool active) {
+  return osc::Message{base(prefix) + "/EyeTrackingActive", {osc::bool_arg(active)}};
 }
 
-std::vector<Message> eye_messages(const fe_sample &s, const std::string &prefix) {
+std::vector<osc::Message> eye_messages(const fe_sample &s, const std::string &prefix) {
   std::array<float, 2> left = gaze_angles(s.gaze[0]);
   std::array<float, 2> right = gaze_angles(s.gaze[1]);
   std::array<float, 2> both = gaze_angles(s.fixation_point);
@@ -63,32 +62,10 @@ std::vector<Message> eye_messages(const fe_sample &s, const std::string &prefix)
       {"EyeX", both[0]},
       {"EyeY", both[1]},
   };
-  std::vector<Message> out;
+  std::vector<osc::Message> out;
   out.push_back(tracking_active(prefix, true));
   for (const std::pair<const char *, float> &v : values) {
-    out.push_back(Message{base(prefix) + "/v2/" + v.first, Message::Kind::Float, v.second, false});
-  }
-  return out;
-}
-
-static void padded(std::vector<uint8_t> &out, const std::string &s) {
-  out.insert(out.end(), s.begin(), s.end());
-  size_t n = 4 - s.size() % 4;
-  out.insert(out.end(), n, 0);
-}
-
-std::vector<uint8_t> encode(const Message &m) {
-  std::vector<uint8_t> out;
-  padded(out, m.address);
-  if (m.kind == Message::Kind::Bool) {
-    padded(out, m.flag ? ",T" : ",F");
-    return out;
-  }
-  padded(out, ",f");
-  uint32_t bits = 0;
-  std::memcpy(&bits, &m.value, sizeof bits);
-  for (int shift = 24; shift >= 0; shift -= 8) {
-    out.push_back(static_cast<uint8_t>(bits >> shift));
+    out.push_back(osc::Message{base(prefix) + "/v2/" + v.first, {osc::float_arg(v.second)}});
   }
   return out;
 }

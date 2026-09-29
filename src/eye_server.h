@@ -18,6 +18,7 @@ typedef struct fe_sample {
   uint32_t producer_state;
   double sample_time;
   float gaze[2][3];
+  float gaze_covariance[2][3];
   float fixation_point[3];
   float openness[2];
 } fe_sample;

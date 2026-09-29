@@ -7,7 +7,7 @@
 #include <cstring>
 #include <functional>
 
-using frameeyeosc::Message;
+using frameeyeosc::osc::Message;
 
 static fe_sample open_eyes() {
   fe_sample s{};
@@ -24,7 +24,7 @@ static fe_sample open_eyes() {
 static float lid(const std::vector<Message> &ms, const std::string &name) {
   for (const Message &m : ms) {
     if (m.address == "/avatar/parameters/FT/v2/" + name) {
-      return m.value;
+      return m.args[0].f;
     }
   }
   return NAN;
@@ -65,8 +65,7 @@ TEST_CASE("the first message marks eye tracking active") {
   std::vector<Message> ms = frameeyeosc::eye_messages(open_eyes(), "/FT");
   REQUIRE(ms.size() == 9);
   CHECK(ms[0].address == "/avatar/parameters/FT/EyeTrackingActive");
-  CHECK(ms[0].kind == Message::Kind::Bool);
-  CHECK(ms[0].flag);
+  CHECK(ms[0].args[0].tag == 'T');
 }
 
 TEST_CASE("invalid samples are rejected") {
@@ -77,20 +76,6 @@ TEST_CASE("invalid samples are rejected") {
   s = open_eyes();
   s.producer_state = 0;
   CHECK_FALSE(frameeyeosc::sample_valid(s));
-}
-
-TEST_CASE("a float message encodes as padded address, tag and big-endian value") {
-  std::vector<uint8_t> b = frameeyeosc::encode(Message{"/a", Message::Kind::Float, 1.0f, false});
-  const uint8_t want[] = {'/', 'a', 0, 0, ',', 'f', 0, 0, 0x3f, 0x80, 0, 0};
-  REQUIRE(b.size() == sizeof want);
-  CHECK(std::memcmp(b.data(), want, sizeof want) == 0);
-}
-
-TEST_CASE("an address of four characters still gets a terminator") {
-  std::vector<uint8_t> b = frameeyeosc::encode(Message{"/abc", Message::Kind::Bool, 0.0f, true});
-  const uint8_t want[] = {'/', 'a', 'b', 'c', 0, 0, 0, 0, ',', 'T', 0, 0};
-  REQUIRE(b.size() == sizeof want);
-  CHECK(std::memcmp(b.data(), want, sizeof want) == 0);
 }
 
 static std::array<float, 3> gen_direction(witness::RNG &rng, const witness::Level &) {
@@ -117,23 +102,4 @@ TEST_CASE("[witness] control: an unclamped gaze is caught") {
   };
   witness::Trial t = witness::resolve<std::array<float, 3>>("unclamped gaze bounded", gen, pred);
   CHECK(t.outcome == witness::Outcome::FOUND);
-}
-
-static std::string gen_address(witness::RNG &rng, const witness::Level &) {
-  std::string s = "/";
-  uint32_t n = rng.uint_range(0, 40);
-  for (uint32_t i = 0; i < n; ++i) {
-    s.push_back(static_cast<char>('a' + rng.uint_range(0, 25)));
-  }
-  return s;
-}
-
-TEST_CASE("[witness] every encoded message is 4-byte aligned and starts with its address") {
-  witness::Generator<std::string> gen = &gen_address;
-  std::function<bool(const std::string &)> pred = [](const std::string &a) {
-    std::vector<uint8_t> b = frameeyeosc::encode(Message{a, Message::Kind::Float, 0.5f, false});
-    return b.size() % 4 == 0 && std::memcmp(b.data(), a.data(), a.size()) == 0 && b[a.size()] == 0;
-  };
-  witness::Trial t = witness::resolve<std::string>("osc alignment", gen, pred);
-  CHECK(t.outcome != witness::Outcome::FOUND);
 }

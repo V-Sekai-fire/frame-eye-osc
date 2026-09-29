@@ -116,6 +116,7 @@ void fe_decode(const uint8_t *record, fe_sample *out) {
   out->producer_state = d.producer_state;
   out->sample_time = d.sample_time;
   memcpy(out->gaze, d.gaze_direction, sizeof out->gaze);
+  memcpy(out->gaze_covariance, d.gaze_covariance_diag, sizeof out->gaze_covariance);
   memcpy(out->fixation_point, d.fixation_point, sizeof out->fixation_point);
   memcpy(out->openness, d.openness, sizeof out->openness);
 }
