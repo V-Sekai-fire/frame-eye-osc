@@ -29,7 +29,7 @@ open FrameEyeOsc Expressions
 structure Tuning where
   closeAt       : Int := 3500    -- raw openness (fraction of relaxed-open) that starts a blink
   openAt        : Int := 5500    -- and that ends it
-  linkAt        : Int := 6500    -- the other eye closes too if it is below this
+  linkAt        : Int := 4500    -- the other eye closes too if it is below this
   closeMs       : Nat := 60
   openMs        : Nat := 140
   squintAt      : Int := 8000    -- partial closure below this counts toward a squint
