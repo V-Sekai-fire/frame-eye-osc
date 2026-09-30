@@ -1,32 +1,6 @@
-# frameeyeosc
+# frame-eye-osc
 
 Special thanks to https://github.com/konsti219/frameeyeosc for writing the original code.
-
-Reading Steam Frame eye-tracking data (gaze and eye openness) and sending it via OSC.
-
-Against what was suspected early on, the Steam Frame does also track eye openness (lid position) in addition to gaze.
-However, this data is only exposed in an internal shared-memory object (`/dev/shm/eye-server.mmap`), and not via any public APIs.
-This small headless program reads data sends it out via OSC as teh standard VRCFT parameters, with a configurable prefix.
-
-This is a port of [konsti219/frameeyeosc](https://github.com/konsti219/frameeyeosc) written in [Slang](https://shader-slang.org): the same shared-memory reader and the same per-eye OSC output. `slangc -target cpp` turns `src/*.slang` into C++, which calls libc through `__extern_cpp` declarations in `src/libc.slang`.
-
-On the headset, with `slangc` on the path, build with CMake and run:
-
-```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFRAMEEYEOSC_BUILD_TESTS=OFF
-cmake --build build
-./build/frameeyeosc --target 127.0.0.1:9000
-```
-
-Tests are an optional Lean package in `tests/`. Lake builds `src/core.slang` with a small C++ shim (`tests/ffi/`) and runs unit checks plus [plausible-witness-dag](https://github.com/fire/plausible-witness-dag) property searches, each paired with a control that plants the defect the property rules out. Lake fetches its dependencies, so this step needs the network; the driver's own build does not.
-
-```sh
-cd tests && lake build && lake exe tests
-```
-
-or `cmake -S . -B build -DFRAMEEYEOSC_LEAN_TESTS=ON && cmake --build build --target lean_tests`.
-
-`contrib/frameeyeosc.service` runs it as a user service.
 
 ## Command-line arguments
 
