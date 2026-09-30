@@ -1,5 +1,7 @@
 # frameeyeosc
 
+Special thanks to https://github.com/konsti219/frameeyeosc for writing the original code.
+
 Reading Steam Frame eye-tracking data (gaze and eye openness) and sending it via OSC.
 
 Against what was suspected early on, the Steam Frame does also track eye openness (lid position) in addition to gaze.
