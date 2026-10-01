@@ -1,7 +1,7 @@
 {"version": "1.2.0",
  "packagesDir": ".lake/packages",
  "packages":
- [{"url": "https://github.com/fire/plausible-witness-dag",
+ [{"url": "https://github.com/V-Sekai-fire/plausible-witness-dag",
    "type": "git",
    "subDir": null,
    "scope": "",
