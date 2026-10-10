@@ -28,4 +28,5 @@ jobs:
       - name: lake build (tests)
         working-directory: tests
         run: |
-          lake build FrameEyeOscTests tests
+          lake build tests
+          .lake/build/bin/tests
