@@ -134,6 +134,13 @@ struct fe_sample {
 
 struct fe_source {
   uint8_t *map;
+  int32_t size;
+  int32_t record;
+  int32_t dominant_at;
+  uint32_t version;
+  uint32_t last_sequence;
+  bool has_last;
+  uint32_t missed;
 };
 
 struct fe_entry {
@@ -202,7 +209,9 @@ bool fe_gains_load(const fe_text *p_path, fe_gains *r_gains, fe_text *r_error);
 
 fe_sample fe_decode(const uint8_t *p_record);
 bool fe_eye_open(const fe_text *p_path, fe_source *r_source, fe_text *r_error);
-int32_t fe_eye_next(const fe_source *p_source, int32_t p_timeout_ms, fe_sample *r_sample, fe_text *r_error);
+int32_t fe_eye_next(fe_source *r_source, int32_t p_timeout_ms, fe_sample *r_sample, fe_text *r_error);
+int32_t fe_dominant_eye(const uint8_t *p_bytes);
+int32_t fe_eye_dominant(const fe_source *p_source);
 void fe_eye_close(fe_source *r_source);
 bool fe_sample_valid(const fe_sample *p_sample);
 fe_message fe_tracking_active(const fe_text *p_prefix, bool p_active);
@@ -210,10 +219,10 @@ void fe_reference_messages(const fe_sample *p_sample, const fe_text *p_prefix, f
 }
 
 static const int FE_REFERENCE_MESSAGES = 9;
-static const int FE_RECORD_OFFSET = 0x152;
 static const int FE_RECORD_SIZE = 0xebc;
-static const int FE_SHM_SIZE = 0x4f21a;
-static const uint32_t FE_SHM_VERSION = 4;
+// Version 4 has the record at 0x152; version 5 inserts the 5-byte dominant-eye setting there.
+inline int fe_shm_size(uint32_t p_version) { return p_version == 5 ? 0x4f21f : 0x4f21a; }
+inline int fe_record_offset(uint32_t p_version) { return p_version == 5 ? 0x157 : 0x152; }
 
 inline fe_text fe_text_of(const char *p_text) {
   fe_text t;

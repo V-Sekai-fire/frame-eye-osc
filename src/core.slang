@@ -81,9 +81,14 @@ public export __extern_cpp bool fe_eye_open(Text p_path, out Source r_source, ou
     return eye_open(p_path, r_source, r_error);
 }
 
-public export __extern_cpp int fe_eye_next(Source p_source, int p_timeout_ms, out Sample r_sample, out Text r_error)
+public export __extern_cpp int fe_eye_next(inout Source r_source, int p_timeout_ms, out Sample r_sample, out Text r_error)
 {
-    return eye_next(p_source, p_timeout_ms, r_sample, r_error);
+    return eye_next(r_source, p_timeout_ms, r_sample, r_error);
+}
+
+public export __extern_cpp int fe_eye_dominant(Source p_source)
+{
+    return eye_dominant(p_source);
 }
 
 public export __extern_cpp void fe_eye_close(inout Source r_source)

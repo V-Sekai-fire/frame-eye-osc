@@ -221,6 +221,20 @@ def ioChecks : IO (List (String × Bool)) := do
       let _ ← Ffi.eyeReadOnce path 20
       pure false
     catch e => pure (((toString e).splitOn "version 3").length > 1)
+  -- Version 5 (SteamOS 0.4.3 on): the record sits 5 bytes later, after the dominant-eye setting.
+  let _ ← Ffi.shmCreate path 5
+  let producer5 ← IO.asTask do
+    IO.sleep 20
+    Ffi.shmPublish path 0.25 0.75
+  let fifth ← try Ffi.eyeReadOnce path 1000 catch _ => pure (floats [])
+  let _ ← IO.wait producer5
+  -- A sample published while the last one was being processed is read at once, because the
+  -- next one was requested in the same lock that took the last.
+  let _ ← Ffi.shmCreate path 5
+  let _ ← Ffi.shmSetDominant path 1 1
+  let busy ← try Ffi.eyeReadBusy path catch _ => pure (floats [])
+  let _ ← Ffi.shmCreate path 4
+  let busy4 ← try Ffi.eyeReadBusy path catch _ => pure (floats [])
   IO.FS.removeFile path
   let back ← Ffi.calibRoundTrip "/tmp/frameeyeosc-calib-test.txt" (floats [0.1, 0.7, 0.95, 0.05, 0.8, 1.1])
   pure [
@@ -228,6 +242,17 @@ def ioChecks : IO (List (String × Bool)) := do
       get first 1 == (0.1 : Float).toFloat32.toFloat && get first 2 == (0.9 : Float).toFloat32.toFloat &&
       get quiet 0 == 0.0),
     ("control: a wrong shared-memory version is refused", refused),
+    ("version 5 is read at its own record offset", get fifth 0 == 1.0 &&
+      get fifth 1 == (0.25 : Float).toFloat32.toFloat && get fifth 2 == (0.75 : Float).toFloat32.toFloat),
+    ("taking a sample requests the next one in the same lock", get busy 0 == 1.0 && get busy 1 == 1.0),
+    ("a sample published while busy is read without waiting", get busy 2 == 1.0 &&
+      get busy 3 == (0.6 : Float).toFloat32.toFloat && get busy 4 == 0.0),
+    ("version 5 reports the dominant eye; version 4 has none", get busy 5 == 1.0 && get busy4 5 == -1.0),
+    ("the dominant-eye setting parses off, left and right, and distrusts anything else",
+      let d := fun (bs : List UInt8) => Ffi.dominantEye (ByteArray.mk bs.toArray)
+      d [0, 0xff, 0xff, 0xff, 0xff] == -1 && d [0, 1, 0, 0, 0] == -1 && d [1, 0, 0, 0, 0] == 0 &&
+      d [1, 1, 0, 0, 0] == 1 && d [1, 2, 0, 0, 0] == -2 && d [1, 0xff, 0xff, 0xff, 0xff] == -2 &&
+      d [2, 0, 0, 0, 0] == -2),
     ("calibration saves and loads", back.size == 6 && (get back 5 - 1.1).abs < 1e-5 && (get back 1 - 0.7).abs < 1e-5) ]
 
 -- ── Properties, each with a control that plants the defect ───────────────────
