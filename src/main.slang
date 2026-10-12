@@ -459,14 +459,13 @@ public export __extern_cpp int main(int argc, uint8_t** argv, uint8_t** envp)
         return 1;
     }
     Source eyes;
-    if (!eye_open(o.source, eyes, error))
-    {
-        log_line(error);
-        return 1;
-    }
-    Text hello = text_of("Reading ");
+    eyes.map = (uint8_t*)0;
+    bool opened = false;
+    Text open_error = text_empty();
+    int dominant = -1;
+    Text hello = text_of("Sending OSC from ");
     text_add_text(hello, o.source);
-    text_add(hello, " and sending OSC to ");
+    text_add(hello, " to ");
     text_add_text(hello, o.target);
     if (o.anime)
     {
@@ -482,13 +481,64 @@ public export __extern_cpp int main(int argc, uint8_t** argv, uint8_t** envp)
     Message reference[REFERENCE_MESSAGES];
     for (;;)
     {
+        // While the shared memory can't be read (SteamVR not started yet, a version not known,
+        // replaced by the server), keep running and try again every second. Each new reason is
+        // logged once, not every try.
+        if (!opened)
+        {
+            if (!eye_open(o.source, eyes, error))
+            {
+                if (!text_same(error, open_error))
+                {
+                    Text t = text_of("Can't read eye data (");
+                    text_add_text(t, error);
+                    text_add(t, "); retrying every 1 s");
+                    log_line(t);
+                    open_error = error;
+                }
+                if (active)
+                {
+                    send_message(fd, fe_tracking_active(o.prefix, false), &g_scratch[0]);
+                    active = false;
+                }
+                usleep(1000000);
+                continue;
+            }
+            opened = true;
+            open_error = text_empty();
+            dominant = -1;
+            Text t = text_of("Reading ");
+            text_add_text(t, o.source);
+            text_add(t, " (version ");
+            text_add_int(t, int64_t(eyes.version));
+            text_add(t, ")");
+            log_line(t);
+        }
         Sample s;
         int r = eye_next(eyes, o.anime ? 50 : 1000, s, error);
         if (r < 0)
         {
             log_line(error);
             eye_close(eyes);
-            return 1;
+            opened = false;
+            continue;
+        }
+        int now_dominant = eye_dominant(eyes);
+        if (now_dominant != -2 && now_dominant != dominant)
+        {
+            dominant = now_dominant;
+            if (dominant < 0)
+            {
+                log_line(text_of("Track Dominant Eye Only is off"));
+            }
+            else if (dominant == 0)
+            {
+                log_line(text_of("Track Dominant Eye Only is on: the Frame tracks the left eye alone"));
+            }
+            else
+            {
+                log_line(text_of("Track Dominant Eye Only is on: the Frame tracks the right eye alone"));
+            }
         }
         int64_t now = now_ms();
         if (learn_fd >= 0)
