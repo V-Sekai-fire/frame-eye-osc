@@ -64,6 +64,19 @@ namespace FrameEyeOscTests.Ffi
 @[extern "fe_lean_learn"] opaque learn : @& Array ByteArray → String × Array ByteArray
 @[extern "fe_lean_learned_counts"] opaque learnedCounts : @& Array ByteArray → FloatArray
 
+@[extern "fe_lean_message_argc"] opaque messageArgc : @& ByteArray → UInt32
+@[extern "fe_lean_message_int"] opaque messageInt : @& ByteArray → UInt32 → UInt32
+@[extern "fe_lean_steamlink_closed"] opaque steamlinkClosed : Float → Float
+@[extern "fe_lean_steamlink_messages"] opaque steamlinkMessages : @& FloatArray → Array ByteArray
+@[extern "fe_lean_gaze_vector"] opaque gazeVector : Float → Float → FloatArray
+@[extern "fe_lean_native_messages"] opaque nativeMessages : @& FloatArray → UInt8 → Array ByteArray
+@[extern "fe_lean_active_message"] opaque activeMessage : @& String → UInt8 → UInt32 → Array ByteArray
+@[extern "fe_lean_etvr_lid"] opaque etvrLid : Float → Float
+@[extern "fe_lean_etvr_messages"] opaque etvrMessages : @& FloatArray → @& String → Array ByteArray
+@[extern "fe_lean_livelink_shapes"] opaque livelinkShapes : @& FloatArray → FloatArray
+@[extern "fe_lean_livelink_packet"] opaque livelinkPacket : Float → @& FloatArray → ByteArray
+@[extern "fe_lean_throttle_count"] opaque throttleCount : UInt32 → UInt32 → UInt8 → UInt32
+
 @[extern "fe_lean_calib_round_trip"] opaque calibRoundTrip : @& String → @& FloatArray → IO FloatArray
 
 end FrameEyeOscTests.Ffi

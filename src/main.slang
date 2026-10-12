@@ -10,6 +10,7 @@ import eye_server;
 import kernels;
 import libc;
 import osc;
+import outputs;
 import params;
 import text;
 
@@ -39,21 +40,25 @@ struct Options
     bool anime;
     bool heuristics;
     bool native;
+    bool steamlink;
+    int output;
+    int active_type;
     int learn_port;
     float lost_at;
 };
 
 int usage()
 {
-    log_line(text_of("usage: frameeyeosc [--target HOST:PORT] [--prefix /FT] [--source PATH]"));
-    log_line(text_of("                   [--style reference|anime] [--no-heuristics] [--native]"));
+    log_line(text_of("usage: frameeyeosc [--target HOST[:PORT]] [--prefix /FT] [--source PATH]"));
+    log_line(text_of("                   [--output vrchat|etvr|livelink] [--eye-tracking-active bool|float|off]"));
+    log_line(text_of("                   [--style reference|anime] [--no-heuristics] [--native] [--steamlink-params]"));
     log_line(text_of("                   [--learn-port PORT] [--gains FILE] [--lost-at COV]"));
     return 2;
 }
 
 bool parse(int p_argc, uint8_t** p_argv, out Options r_options)
 {
-    r_options.target = text_of("127.0.0.1:9000");
+    r_options.target = text_of("127.0.0.1");
     r_options.prefix = text_of("/FT");
     r_options.source = text_of("/dev/shm/eye-server.mmap");
     r_options.gains = text_empty();
@@ -61,6 +66,9 @@ bool parse(int p_argc, uint8_t** p_argv, out Options r_options)
     r_options.anime = false;
     r_options.heuristics = true;
     r_options.native = false;
+    r_options.steamlink = false;
+    r_options.output = OUTPUT_VRCHAT;
+    r_options.active_type = ACTIVE_BOOL;
     r_options.learn_port = 0;
     r_options.lost_at = 0.02;
     for (int i = 1; i < p_argc; i++)
@@ -74,6 +82,11 @@ bool parse(int p_argc, uint8_t** p_argv, out Options r_options)
         if (text_equals(a, "--native"))
         {
             r_options.native = true;
+            continue;
+        }
+        if (text_equals(a, "--steamlink-params"))
+        {
+            r_options.steamlink = true;
             continue;
         }
         if (i + 1 >= p_argc)
@@ -94,6 +107,30 @@ bool parse(int p_argc, uint8_t** p_argv, out Options r_options)
         else if (text_equals(a, "--source"))
         {
             r_options.source = v;
+        }
+        else if (text_equals(a, "--output") && text_equals(v, "vrchat"))
+        {
+            r_options.output = OUTPUT_VRCHAT;
+        }
+        else if (text_equals(a, "--output") && text_equals(v, "etvr"))
+        {
+            r_options.output = OUTPUT_ETVR;
+        }
+        else if (text_equals(a, "--output") && text_equals(v, "livelink"))
+        {
+            r_options.output = OUTPUT_LIVELINK;
+        }
+        else if (text_equals(a, "--eye-tracking-active") && text_equals(v, "bool"))
+        {
+            r_options.active_type = ACTIVE_BOOL;
+        }
+        else if (text_equals(a, "--eye-tracking-active") && text_equals(v, "float"))
+        {
+            r_options.active_type = ACTIVE_FLOAT;
+        }
+        else if (text_equals(a, "--eye-tracking-active") && text_equals(v, "off"))
+        {
+            r_options.active_type = ACTIVE_OFF;
         }
         else if (text_equals(a, "--style") && (text_equals(v, "reference") || text_equals(v, "anime")))
         {
@@ -121,6 +158,17 @@ bool parse(int p_argc, uint8_t** p_argv, out Options r_options)
         {
             return false;
         }
+    }
+    bool has_port = false;
+    for (int k = 0; k < r_options.target.size; k++)
+    {
+        has_port = has_port || r_options.target.bytes[k] == 58;
+    }
+    if (!has_port)
+    {
+        // VRChat 9000, the ETVR module 8889, VRCFaceTracking's LiveLink module 11111.
+        text_add(r_options.target, ":");
+        text_add_int(r_options.target, r_options.output == OUTPUT_ETVR ? 8889 : r_options.output == OUTPUT_LIVELINK ? 11111 : 9000);
     }
     Text p = r_options.prefix;
     bool only_slashes = true;
@@ -192,6 +240,18 @@ int listen_udp(int p_port)
     return fd;
 }
 
+__global int64_t g_dropped;
+
+// Sends one datagram without waiting: one the network cannot take at once is dropped and counted
+// (g_dropped), so the eye data keeps coming in.
+void send_datagram(int p_fd, uint8_t* p_bytes, int p_size)
+{
+    if (send(p_fd, p_bytes, uint64_t(p_size), MSG_DONTWAIT) < 0 && errno_value() == EAGAIN)
+    {
+        g_dropped += 1;
+    }
+}
+
 // Encodes into p_scratch, which must hold OSC_PACKET bytes.
 void send_message(int p_fd, Message p_message, uint8_t* p_scratch)
 {
@@ -200,7 +260,109 @@ void send_message(int p_fd, Message p_message, uint8_t* p_scratch)
     {
         return;
     }
-    send(p_fd, p_scratch, uint64_t(n), 0);
+    send_datagram(p_fd, p_scratch, n);
+}
+
+void send_messages(int p_fd, Message* p_messages, int p_count, uint8_t* p_scratch)
+{
+    for (int k = 0; k < p_count; k++)
+    {
+        send_message(p_fd, p_messages[k], p_scratch);
+    }
+}
+
+__global Message g_out[16];
+__global float g_shapes[LIVELINK_SHAPES];
+__global uint8_t g_packet[LIVELINK_PACKET];
+__global int64_t g_livelink_due;
+
+double time_of_day()
+{
+    TimeSpec t = { 0, 0 };
+    clock_gettime(CLOCK_REALTIME, &t);
+    return double(t.seconds % 86400) + double(t.nanoseconds) / 1.0e9;
+}
+
+// One Live Link packet, at most 50 a second (VRCFaceTracking's LiveLink module reads no faster).
+void send_livelink(int p_fd, Eyes p_eyes, int64_t p_now, bool p_force)
+{
+    if (!fe_throttle(g_livelink_due, p_now, 20) && !p_force)
+    {
+        return;
+    }
+    fe_livelink_shapes(p_eyes, &g_shapes[0]);
+    int n = fe_livelink_packet(time_of_day(), &g_shapes[0], &g_packet[0]);
+    send_datagram(p_fd, &g_packet[0], n);
+}
+
+// What every output sends besides the style's own VRChat parameters: ETVR's per-eye values, the
+// Live Link packet, and in VRChat mode Steam Link's names and VRChat's own eye input when asked.
+void send_outputs(Options p_options, Eyes p_eyes, int64_t p_now, int p_fd, uint8_t* p_scratch)
+{
+    if (p_options.output == OUTPUT_ETVR)
+    {
+        send_messages(p_fd, &g_out[0], fe_etvr_messages(p_eyes, p_options.prefix, &g_out[0]), p_scratch);
+        return;
+    }
+    if (p_options.output == OUTPUT_LIVELINK)
+    {
+        send_livelink(p_fd, p_eyes, p_now, false);
+        return;
+    }
+    if (p_options.steamlink)
+    {
+        send_messages(p_fd, &g_out[0], fe_steamlink_messages(p_eyes, &g_out[0]), p_scratch);
+    }
+    if (p_options.native)
+    {
+        send_messages(p_fd, &g_out[0], fe_native_messages(p_eyes, false, &g_out[0]), p_scratch);
+    }
+}
+
+Eyes neutral_eyes()
+{
+    Eyes e;
+    for (int k = 0; k < 6; k++)
+    {
+        e.gaze[k] = 0.0;
+    }
+    e.lid[0] = LID_RELAXED;
+    e.lid[1] = LID_RELAXED;
+    return e;
+}
+
+// Once tracking is lost: EyeTrackingActive false, and relaxed open eyes looking ahead for the
+// outputs that have no "not active" (Steam Link's names, VRChat's own input, Live Link), since
+// VRChat keeps the last values and the eyes would stay shut if tracking was lost in a blink.
+void send_lost(Options p_options, int64_t p_now, int p_fd, uint8_t* p_scratch)
+{
+    if (p_options.output == OUTPUT_LIVELINK)
+    {
+        send_livelink(p_fd, neutral_eyes(), p_now, true);
+        return;
+    }
+    if (p_options.output != OUTPUT_VRCHAT)
+    {
+        return;
+    }
+    Message m;
+    if (fe_active_message(p_options.prefix, false, p_options.active_type, m))
+    {
+        send_message(p_fd, m, p_scratch);
+    }
+    send_outputs(p_options, neutral_eyes(), p_now, p_fd, p_scratch);
+}
+
+// The reference style's eyes: raw gaze and each eye's own clamped openness.
+Eyes reference_eyes(Sample p_sample)
+{
+    Eyes e;
+    fe_gaze_angles(p_sample.gaze[0], e.gaze[0], e.gaze[1]);
+    fe_gaze_angles(p_sample.gaze[1], e.gaze[2], e.gaze[3]);
+    fe_gaze_angles(p_sample.fixation_point, e.gaze[4], e.gaze[5]);
+    e.lid[0] = fe_clamp01(p_sample.openness[0]);
+    e.lid[1] = fe_clamp01(p_sample.openness[1]);
+    return e;
 }
 
 int64_t now_ms()
@@ -367,7 +529,17 @@ void driver_send(inout Driver r_driver, Sample p_sample, int64_t p_now, int p_fd
         r_driver.saved_at = p_now;
         calib_save(calib_path(r_driver.options.home), r_driver.calib);
     }
-    for (int k = 0; k < r_driver.entry_count; k++)
+    Eyes eyes;
+    eyes.gaze[0] = output.left.x;
+    eyes.gaze[1] = output.left.y;
+    eyes.gaze[2] = output.right.x;
+    eyes.gaze[3] = output.right.y;
+    eyes.gaze[4] = output.x;
+    eyes.gaze[5] = output.y;
+    eyes.lid[0] = output.left.lid;
+    eyes.lid[1] = output.right.lid;
+    int plan = r_driver.options.output == OUTPUT_VRCHAT ? r_driver.entry_count : 0;
+    for (int k = 0; k < plan; k++)
     {
         Message m = message_for(r_driver.entries[k], output);
         if (!refresh && r_driver.has_last[k] && osc_arg_equal(r_driver.last[k], m.args[0]))
@@ -378,14 +550,7 @@ void driver_send(inout Driver r_driver, Sample p_sample, int64_t p_now, int p_fd
         r_driver.has_last[k] = true;
         send_message(p_fd, m, p_scratch);
     }
-    if (!r_driver.options.native)
-    {
-        return;
-    }
-    Message native = osc_message(text_of("/tracking/eye/CenterPitchYaw"));
-    osc_add_float(native, -gy * 45.0);
-    osc_add_float(native, gx * 45.0);
-    send_message(p_fd, native, p_scratch);
+    send_outputs(r_driver.options, eyes, p_now, p_fd, p_scratch);
 }
 
 static const int LEARN_BATCH = 64;
@@ -478,6 +643,8 @@ public export __extern_cpp int main(int argc, uint8_t** argv, uint8_t** envp)
     log_line(hello);
     driver_init(g_driver, o, gains);
     bool active = false;
+    int64_t dropped_logged_at = now_ms();
+    int64_t valid_at = 0;
     Message reference[REFERENCE_MESSAGES];
     for (;;)
     {
@@ -546,27 +713,51 @@ public export __extern_cpp int main(int argc, uint8_t** argv, uint8_t** envp)
             drain_learning(learn_fd, g_driver, &g_scratch[0], &g_learned_batch[0]);
             driver_adopt(g_driver, now);
         }
+        if (g_dropped > 0 && now - dropped_logged_at >= 60000)
+        {
+            Text t = text_of("Dropped ");
+            text_add_int(t, g_dropped);
+            text_add(t, " datagrams to ");
+            text_add_text(t, o.target);
+            text_add(t, " the network could not take at once");
+            log_line(t);
+            g_dropped = 0;
+            dropped_logged_at = now;
+        }
         bool valid = r == 1 && fe_sample_valid(s);
         if (valid && o.anime)
         {
             driver_send(g_driver, s, now, fd, &g_scratch[0]);
+            active = true;
+            valid_at = now;
             continue;
         }
         if (valid)
         {
-            fe_reference_messages(s, o.prefix, &reference[0]);
-            for (int k = 0; k < REFERENCE_MESSAGES; k++)
+            if (o.output == OUTPUT_VRCHAT)
             {
-                send_message(fd, reference[k], &g_scratch[0]);
+                // The reference messages lead with EyeTrackingActive as a bool; it goes as asked.
+                fe_reference_messages(s, o.prefix, &reference[0]);
+                Message m;
+                if (fe_active_message(o.prefix, true, o.active_type, m))
+                {
+                    send_message(fd, m, &g_scratch[0]);
+                }
+                for (int k = 1; k < REFERENCE_MESSAGES; k++)
+                {
+                    send_message(fd, reference[k], &g_scratch[0]);
+                }
             }
+            send_outputs(o, reference_eyes(s), now, fd, &g_scratch[0]);
             active = true;
+            valid_at = now;
             continue;
         }
-        if (!active)
+        if (!active || (r == 0 && now - valid_at < 1000))
         {
             continue;
         }
-        send_message(fd, fe_tracking_active(o.prefix, false), &g_scratch[0]);
+        send_lost(o, now, fd, &g_scratch[0]);
         active = false;
     }
 }

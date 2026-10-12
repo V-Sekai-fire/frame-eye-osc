@@ -20,7 +20,9 @@ public static const int SOCK_DGRAM = 2;
 public static const int SOL_SOCKET = 1;
 public static const int SO_REUSEADDR = 2;
 public static const int MSG_DONTWAIT = 0x40;
+public static const int CLOCK_REALTIME = 0;
 public static const int CLOCK_MONOTONIC = 1;
+public static const int EAGAIN = 11;
 public static const int EOWNERDEAD = 130;
 
 public struct IoVec

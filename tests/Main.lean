@@ -207,6 +207,87 @@ def paramChecks : List (String × Bool) :=
     ("the fallback plan sends every v2 float under the prefix", fallback.size == (Ffi.v2Count ()).toNat &&
       (findEntry fallback "/avatar/parameters/FT/v2/EyeLidRight").isSome) ]
 
+-- ── Outputs (constants and layouts from sasaken1102r's frameeyeosc) ─────────
+
+/-- Gaze L x, y, R x, y, combined x, y, then both VRCFT eyelids. -/
+def eyesOf (gaze : List Float) (lidL lidR : Float) : FloatArray := floats (gaze ++ [lidL, lidR])
+def near (a b : Float) : Bool := (a - b).abs < 1e-5
+def f32 (x : Float) : Float := x.toFloat32.toFloat
+def msgNamed (ms : Array ByteArray) (address : String) : Option ByteArray :=
+  ms.find? (Ffi.messageAddress · == address)
+def argF (ms : Array ByteArray) (address : String) (i : Nat := 0) : Option Float :=
+  (msgNamed ms address).map (Ffi.messageFloat · i.toUInt32)
+def argI (ms : Array ByteArray) (address : String) : Option UInt32 :=
+  (msgNamed ms address).map (Ffi.messageInt · 0)
+/-- Big-endian float bytes. -/
+def beF (x : Float) : List Nat := be32 x.toFloat32.toBits.toNat
+
+def outputChecks : List (String × Bool) :=
+  let e := eyesOf [0.2, -0.1, 0.25, -0.1, 0.22, -0.1] 0.3 0.9
+  let sl := Ffi.steamlinkMessages e
+  let p (n : String) := s!"/avatar/parameters/{n}"
+  let order := sl.toList.map Ffi.messageAddress
+  let nat := Ffi.nativeMessages e 0
+  let natInd := Ffi.nativeMessages e 1
+  let closedAmt := argF nat "/tracking/eye/EyesClosedAmount"
+  let v := Ffi.gazeVector 0.3 (-0.2)
+  -- Unity +Z forward back to the Frame's -Z forward, then the angles we send.
+  let back := Ffi.gazeAngles (floats [get v 0, get v 1, -(get v 2)])
+  let actB := Ffi.activeMessage "/FT" 1 0
+  let actF := Ffi.activeMessage "/FT" 0 1
+  let actOff := Ffi.activeMessage "/FT" 1 2
+  let et := Ffi.etvrMessages e "/FT"
+  let shapes := Ffi.livelinkShapes e
+  let ramp := floats ((List.range 61).map fun i => i.toFloat / 100.0)
+  let pkt := Ffi.livelinkPacket 1000.5 ramp
+  let expected := [6] ++ be32 11 ++ "frameeyeosc".toList.map (·.toNat) ++ be32 10 ++
+    "SteamFrame".toList.map (·.toNat) ++ be32 90045 ++ beF 0.0 ++ be32 90 ++ be32 1 ++ [61] ++
+    (List.range 61).flatMap fun i => beF (i.toFloat / 100.0)
+  let later := Ffi.livelinkPacket (1000.5 + 0.25 / 90.0) ramp
+  [ ("Steam Link names come in its order, Y turned over, eyelid as closedness",
+      order == [p "LeftEyeX", p "LeftEyeY", p "RightEyeX", p "RightEyeY",
+                p "RightEyeLid", p "RightEyeLidExpandedSqueeze", p "RightEyeSqueezeToggle", p "RightEyeWidenToggle",
+                p "LeftEyeLid", p "LeftEyeLidExpandedSqueeze", p "LeftEyeSqueezeToggle", p "LeftEyeWidenToggle"] &&
+      argF sl (p "LeftEyeY") == some (f32 0.1) && argF sl (p "RightEyeLid") == some 0.0 &&
+      (argF sl (p "LeftEyeLid")).any (near · 0.6)),
+    ("Steam Link squeeze follows a half-closed eye, and widen is always 1",
+      argI sl (p "LeftEyeSqueezeToggle") == some 1 && argI sl (p "RightEyeSqueezeToggle") == some 0 &&
+      argF sl (p "LeftEyeLidExpandedSqueeze") == some 0.0 && argF sl (p "RightEyeLidExpandedSqueeze") == some (f32 0.8) &&
+      argI sl (p "LeftEyeWidenToggle") == some 1 &&
+      (msgNamed sl (p "LeftEyeSqueezeToggle")).map tagOf == some 'i'),
+    ("Steam Link closedness: relaxed and widened are open, shut is 1",
+      Ffi.steamlinkClosed 0.75 == 0.0 && Ffi.steamlinkClosed 1.0 == 0.0 && Ffi.steamlinkClosed 0.0 == 1.0),
+    ("the gaze vector undoes the gaze angles", near (get back 0) 0.3 && near (get back 1) (-0.2) &&
+      near (get v 0 * get v 0 + get v 1 * get v 1 + get v 2 * get v 2) 1.0 && get v 2 > 0.0),
+    ("VRChat's own eyes: one look address and the closed amount of both eyelids",
+      nat.size == 2 && Ffi.messageAddress nat[0]! == "/tracking/eye/CenterVec" && Ffi.messageArgc nat[0]! == 3 &&
+      closedAmt.any (near · (1.0 - (0.3 + 0.9) / 2.0 / 0.75))),
+    ("VRChat's own eyes, moved separately, send both vectors",
+      natInd.size == 2 && Ffi.messageAddress natInd[0]! == "/tracking/eye/LeftRightVec" &&
+      Ffi.messageArgc natInd[0]! == 6),
+    ("EyeTrackingActive goes as a bool, a float or not at all",
+      actB.size == 1 && Ffi.messageAddress actB[0]! == "/avatar/parameters/FT/EyeTrackingActive" &&
+      tagOf actB[0]! == 'T' && actF.size == 1 && tagOf actF[0]! == 'f' && Ffi.messageFloat actF[0]! 0 == 0.0 &&
+      actOff.size == 0),
+    ("ETVR eyelids treat relaxed as fully open", Ffi.etvrLid 0.0 == 0.0 && near (Ffi.etvrLid 0.375) 0.5 &&
+      Ffi.etvrLid 0.75 == 1.0 && Ffi.etvrLid 1.0 == 1.0),
+    ("ETVR gets only the six per-eye values",
+      et.toList.map Ffi.messageAddress == ["EyeLeftX", "EyeLeftY", "EyeRightX", "EyeRightY", "EyeLidLeft",
+        "EyeLidRight"].map (s!"/avatar/parameters/FT/v2/{·}") &&
+      (argF et "/avatar/parameters/FT/v2/EyeLidLeft").any (near · 0.4)),
+    ("Live Link shapes split each eyelid into blink and widen, pitch turned over",
+      shapes.size == 61 && near (get shapes 0) 0.6 && get shapes 6 == 0.0 && get shapes 7 == 0.0 &&
+      near (get shapes 13) 0.6 && get shapes 55 == f32 0.2 && get shapes 56 == f32 0.1 &&
+      get shapes 58 == f32 0.25 && get shapes 59 == f32 0.1),
+    ("the Live Link packet matches the Live Link Face layout",
+      pkt.size == 291 && pkt.toList.map (·.toNat) == expected),
+    ("Live Link keeps a steady 50 a second from 90 Hz samples (control: 20 ms since the last send gives 44)",
+      let steady := Ffi.throttleCount 11111 10 0
+      let planted := Ffi.throttleCount 11111 10 1
+      steady ≥ 495 && steady ≤ 501 && planted < 460),
+    ("the Live Link frame carries its fraction",
+      (later.extract 30 34).toList.map (·.toNat) == be32 90045 && (later.extract 34 38).toList.map (·.toNat) == beF 0.25) ]
+
 def ioChecks : IO (List (String × Bool)) := do
   let path := "/dev/shm/frameeyeosc-lean-test"
   let _ ← Ffi.shmCreate path 4
@@ -362,7 +443,8 @@ end FrameEyeOscTests
 
 open FrameEyeOscTests in
 def main : IO UInt32 := do
-  let unit := gazeChecks ++ referenceChecks ++ recordChecks ++ oscChecks ++ expressionChecks ++ animeChecks ++ paramChecks
+  let unit := gazeChecks ++ referenceChecks ++ recordChecks ++ oscChecks ++ expressionChecks ++ animeChecks ++ paramChecks ++
+    outputChecks
   let io ← ioChecks
   let mut bad := 0
   for (name, ok) in unit ++ io do

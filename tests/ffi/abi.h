@@ -25,7 +25,13 @@ struct fe_arg {
 struct fe_message {
   fe_text address;
   int32_t argc;
-  fe_arg args[4];
+  fe_arg args[6];
+};
+
+// Gaze (left x, y, right x, y, combined x, y) and both VRCFT eyelids, as one output sends them.
+struct fe_eyes {
+  float gaze[6];
+  float lid[2];
 };
 
 struct fe_vec3 {
@@ -216,6 +222,17 @@ void fe_eye_close(fe_source *r_source);
 bool fe_sample_valid(const fe_sample *p_sample);
 fe_message fe_tracking_active(const fe_text *p_prefix, bool p_active);
 void fe_reference_messages(const fe_sample *p_sample, const fe_text *p_prefix, fe_message *r_messages);
+
+float fe_steamlink_closed(float p_lid);
+int32_t fe_steamlink_messages(const fe_eyes *p_eyes, fe_message *r_messages);
+fe_vec3 fe_gaze_vector(float p_x, float p_y);
+int32_t fe_native_messages(const fe_eyes *p_eyes, bool p_independent, fe_message *r_messages);
+bool fe_active_message(const fe_text *p_prefix, bool p_active, int32_t p_type, fe_message *r_message);
+float fe_etvr_lid(float p_lid);
+int32_t fe_etvr_messages(const fe_eyes *p_eyes, const fe_text *p_prefix, fe_message *r_messages);
+void fe_livelink_shapes(const fe_eyes *p_eyes, float *r_shapes);
+int32_t fe_livelink_packet(double p_time, const float *p_shapes, uint8_t *r_out);
+bool fe_throttle(int64_t *r_due, int64_t p_now, int64_t p_interval_ms);
 }
 
 static const int FE_REFERENCE_MESSAGES = 9;
