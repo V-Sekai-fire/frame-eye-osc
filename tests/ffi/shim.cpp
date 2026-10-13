@@ -279,13 +279,15 @@ LEAN_EXPORT lean_obj_res fe_lean_decode(b_lean_obj_arg p_record) {
   return sample_array(fe_decode(lean_sarray_cptr(p_record)));
 }
 
-// A mapping laid out like the eye server's, with a process-shared robust mutex.
+// A mapping laid out like the eye server's, with a process-shared robust mutex. Versions other
+// than 5 get version 4's size, so a refused version is refused by its number, not its size.
 LEAN_EXPORT lean_obj_res fe_lean_shm_create(b_lean_obj_arg p_path, uint32_t p_version, lean_obj_arg) {
+  const int size = fe_shm_size(p_version);
   int fd = open(lean_string_cstr(p_path), O_RDWR | O_CREAT | O_TRUNC, 0600);
-  if (fd < 0 || ftruncate(fd, FE_SHM_SIZE) != 0) {
+  if (fd < 0 || ftruncate(fd, size) != 0) {
     return lean_io_result_mk_ok(lean_box(0));
   }
-  uint8_t *m = (uint8_t *)mmap(nullptr, FE_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  uint8_t *m = (uint8_t *)mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
   close(fd);
   const uint32_t head[2] = {p_version, 1};
   std::memcpy(m, head, sizeof head);
@@ -294,27 +296,85 @@ LEAN_EXPORT lean_obj_res fe_lean_shm_create(b_lean_obj_arg p_path, uint32_t p_ve
   pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
   pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST);
   pthread_mutex_init((pthread_mutex_t *)(m + 0x08), &attr);
-  munmap(m, FE_SHM_SIZE);
+  munmap(m, size);
   return lean_io_result_mk_ok(lean_box(1));
 }
 
-// Writes both openness values and bumps the sequence, under the mutex, as the server does.
-LEAN_EXPORT lean_obj_res fe_lean_shm_publish(b_lean_obj_arg p_path, double p_left, double p_right, lean_obj_arg) {
-  int fd = open(lean_string_cstr(p_path), O_RDWR);
+namespace {
+
+// The fake server's mapping, at the size its own version says.
+uint8_t *shm_map(const char *p_path, int &r_size, uint32_t &r_version) {
+  int fd = open(p_path, O_RDWR);
   if (fd < 0) {
-    return lean_io_result_mk_ok(lean_box(0));
+    return nullptr;
   }
-  uint8_t *m = (uint8_t *)mmap(nullptr, FE_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  uint32_t version = 0;
+  if (pread(fd, &version, sizeof version, 0) != (ssize_t)sizeof version) {
+    close(fd);
+    return nullptr;
+  }
+  r_version = version;
+  r_size = fe_shm_size(version);
+  uint8_t *m = (uint8_t *)mmap(nullptr, r_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
   close(fd);
+  return m == MAP_FAILED ? nullptr : m;
+}
+
+// Writes both openness values and bumps the sequence, under the mutex, as the server does. The
+// server also clears the request with each sample it publishes.
+bool shm_publish(const char *p_path, float p_left, float p_right) {
+  int size = 0;
+  uint32_t version = 0;
+  uint8_t *m = shm_map(p_path, size, version);
+  if (m == nullptr) {
+    return false;
+  }
   pthread_mutex_lock((pthread_mutex_t *)(m + 0x08));
-  const float open_[2] = {(float)p_left, (float)p_right};
-  std::memcpy(m + FE_RECORD_OFFSET + 0x79, open_, sizeof open_);
+  const uint32_t producing = 1;
+  std::memcpy(m + fe_record_offset(version), &producing, sizeof producing);
+  const float open_[2] = {p_left, p_right};
+  std::memcpy(m + fe_record_offset(version) + 0x79, open_, sizeof open_);
   uint32_t seq = 0;
   std::memcpy(&seq, m + 0x38, sizeof seq);
   seq += 1;
   std::memcpy(m + 0x38, &seq, sizeof seq);
+  const uint32_t cleared = 0;
+  std::memcpy(m + 0x3c, &cleared, sizeof cleared);
   pthread_mutex_unlock((pthread_mutex_t *)(m + 0x08));
-  munmap(m, FE_SHM_SIZE);
+  munmap(m, size);
+  return true;
+}
+
+uint32_t shm_requested(const char *p_path) {
+  int size = 0;
+  uint32_t version = 0;
+  uint8_t *m = shm_map(p_path, size, version);
+  if (m == nullptr) {
+    return 0;
+  }
+  uint32_t requested = 0;
+  std::memcpy(&requested, m + 0x3c, sizeof requested);
+  munmap(m, size);
+  return requested;
+}
+
+} // namespace
+
+LEAN_EXPORT lean_obj_res fe_lean_shm_publish(b_lean_obj_arg p_path, double p_left, double p_right, lean_obj_arg) {
+  return lean_io_result_mk_ok(lean_box(shm_publish(lean_string_cstr(p_path), (float)p_left, (float)p_right) ? 1 : 0));
+}
+
+// Writes version 5's 5-byte "Track Dominant Eye Only" setting: a flag, then the eye as an int32.
+LEAN_EXPORT lean_obj_res fe_lean_shm_set_dominant(b_lean_obj_arg p_path, uint8_t p_flag, int32_t p_eye, lean_obj_arg) {
+  int size = 0;
+  uint32_t version = 0;
+  uint8_t *m = shm_map(lean_string_cstr(p_path), size, version);
+  if (m == nullptr) {
+    return lean_io_result_mk_ok(lean_box(0));
+  }
+  m[0x152] = p_flag;
+  std::memcpy(m + 0x153, &p_eye, sizeof p_eye);
+  munmap(m, size);
   return lean_io_result_mk_ok(lean_box(1));
 }
 
@@ -327,10 +387,55 @@ LEAN_EXPORT lean_obj_res fe_lean_eye_read_once(b_lean_obj_arg p_path, uint32_t p
     return lean_io_result_mk_error(lean_mk_io_user_error(string_of(err)));
   }
   fe_sample s;
+  std::memset(&s, 0, sizeof s);
   int32_t r = fe_eye_next(&src, (int32_t)p_timeout_ms, &s, &err);
   fe_eye_close(&src);
   const float f[3] = {(float)r, s.openness[0], s.openness[1]};
   return lean_io_result_mk_ok(float_array(f, 3));
+}
+
+// One open source read twice, the way the daemon reads it. A server thread publishes the first
+// sample 20 ms in; right after the first read returns, a second sample is published (as if it
+// arrived while the first was being processed), and the second read may not wait at all.
+// [first status, request flag left by the first read, second status, open L of the second,
+//  samples missed, dominant eye].
+LEAN_EXPORT lean_obj_res fe_lean_eye_read_busy(b_lean_obj_arg p_path, lean_obj_arg) {
+  const char *path_c = lean_string_cstr(p_path);
+  fe_text path = text_of(p_path);
+  fe_text err;
+  fe_source src;
+  if (!fe_eye_open(&path, &src, &err)) {
+    return lean_io_result_mk_error(lean_mk_io_user_error(string_of(err)));
+  }
+  pthread_t server;
+  pthread_create(
+      &server, nullptr,
+      [](void *p) -> void * {
+        usleep(20000);
+        shm_publish((const char *)p, 0.2f, 0.3f);
+        return nullptr;
+      },
+      (void *)path_c);
+  fe_sample s;
+  std::memset(&s, 0, sizeof s);
+  int32_t first = fe_eye_next(&src, 1000, &s, &err);
+  pthread_join(server, nullptr);
+  const uint32_t requested = shm_requested(path_c);
+  shm_publish(path_c, 0.6f, 0.7f);
+  int32_t second = fe_eye_next(&src, 0, &s, &err);
+  const int32_t dominant = fe_eye_dominant(&src);
+  const float missed = (float)src.missed;
+  fe_eye_close(&src);
+  const float f[6] = {(float)first, (float)requested, (float)second, s.openness[0], missed, (float)dominant};
+  return lean_io_result_mk_ok(float_array(f, 6));
+}
+
+// -2 for a setting that can't be trusted, -1 off, 0 left, 1 right.
+LEAN_EXPORT int32_t fe_lean_dominant_eye(b_lean_obj_arg p_bytes) {
+  if (lean_sarray_size(p_bytes) < 5) {
+    return -2;
+  }
+  return fe_dominant_eye(lean_sarray_cptr(p_bytes));
 }
 
 // ── OSC ──────────────────────────────────────────────────────────────────────

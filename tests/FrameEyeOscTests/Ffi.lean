@@ -36,6 +36,9 @@ namespace FrameEyeOscTests.Ffi
 @[extern "fe_lean_shm_create"] opaque shmCreate : @& String → UInt32 → IO Bool
 @[extern "fe_lean_shm_publish"] opaque shmPublish : @& String → Float → Float → IO Bool
 @[extern "fe_lean_eye_read_once"] opaque eyeReadOnce : @& String → UInt32 → IO FloatArray
+@[extern "fe_lean_shm_set_dominant"] opaque shmSetDominant : @& String → UInt8 → Int32 → IO Bool
+@[extern "fe_lean_eye_read_busy"] opaque eyeReadBusy : @& String → IO FloatArray
+@[extern "fe_lean_dominant_eye"] opaque dominantEye : @& ByteArray → Int32
 
 @[extern "fe_lean_message"] opaque message : @& String → ByteArray
 @[extern "fe_lean_add_float"] opaque addFloat : @& ByteArray → Float → ByteArray
