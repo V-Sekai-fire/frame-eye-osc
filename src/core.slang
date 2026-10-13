@@ -8,6 +8,7 @@ import config;
 import eye_server;
 import kernels;
 import osc;
+import outputs;
 import params;
 import text;
 

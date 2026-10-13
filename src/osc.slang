@@ -4,7 +4,7 @@ module osc;
 
 import text;
 
-public static const int OSC_ARGS = 4;
+public static const int OSC_ARGS = 6;
 public static const int OSC_PACKET = 65536;
 
 // tag is one of 'f', 'i', 'T', 'F', 's'.

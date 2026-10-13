@@ -446,7 +446,7 @@ LEAN_EXPORT lean_obj_res fe_lean_message(b_lean_obj_arg p_address) {
 
 LEAN_EXPORT lean_obj_res fe_lean_add_float(b_lean_obj_arg p_message, double p_value) {
   fe_message m = read_bytes<fe_message>(p_message);
-  if (m.argc < 4) {
+  if (m.argc < 6) {
     fe_add_float(m, (float)p_value);
   }
   return byte_array(m);
@@ -454,7 +454,7 @@ LEAN_EXPORT lean_obj_res fe_lean_add_float(b_lean_obj_arg p_message, double p_va
 
 LEAN_EXPORT lean_obj_res fe_lean_add_int(b_lean_obj_arg p_message, uint32_t p_value) {
   fe_message m = read_bytes<fe_message>(p_message);
-  if (m.argc < 4) {
+  if (m.argc < 6) {
     fe_add_int(m, (int32_t)p_value);
   }
   return byte_array(m);
@@ -462,7 +462,7 @@ LEAN_EXPORT lean_obj_res fe_lean_add_int(b_lean_obj_arg p_message, uint32_t p_va
 
 LEAN_EXPORT lean_obj_res fe_lean_add_bool(b_lean_obj_arg p_message, uint8_t p_value) {
   fe_message m = read_bytes<fe_message>(p_message);
-  if (m.argc < 4) {
+  if (m.argc < 6) {
     fe_add_bool(m, p_value != 0);
   }
   return byte_array(m);
@@ -470,7 +470,7 @@ LEAN_EXPORT lean_obj_res fe_lean_add_bool(b_lean_obj_arg p_message, uint8_t p_va
 
 LEAN_EXPORT lean_obj_res fe_lean_add_string(b_lean_obj_arg p_message, b_lean_obj_arg p_value) {
   fe_message m = read_bytes<fe_message>(p_message);
-  if (m.argc < 4) {
+  if (m.argc < 6) {
     fe_add_string(m, lean_string_cstr(p_value));
   }
   return byte_array(m);
@@ -612,4 +612,102 @@ LEAN_EXPORT lean_obj_res fe_lean_calib_round_trip(b_lean_obj_arg p_path, b_lean_
   }
   return lean_io_result_mk_ok(struct_array(back));
 }
+
+// ── Outputs ──────────────────────────────────────────────────────────────────
+
+namespace {
+
+lean_obj_res messages_array(const fe_message *p_messages, int32_t p_count) {
+  lean_object *out = lean_mk_empty_array();
+  for (int32_t k = 0; k < p_count; ++k) {
+    out = lean_array_push(out, byte_array(p_messages[k]));
+  }
+  return out;
+}
+
+fe_eyes read_eyes(b_lean_obj_arg p_array) { return read_struct<fe_eyes>(p_array); }
+
+} // namespace
+
+LEAN_EXPORT uint32_t fe_lean_message_argc(b_lean_obj_arg p_message) {
+  return (uint32_t)read_bytes<fe_message>(p_message).argc;
+}
+
+LEAN_EXPORT uint32_t fe_lean_message_int(b_lean_obj_arg p_message, uint32_t p_index) {
+  fe_message m = read_bytes<fe_message>(p_message);
+  return p_index < (uint32_t)m.argc ? (uint32_t)m.args[p_index].i : 0;
+}
+
+LEAN_EXPORT double fe_lean_steamlink_closed(double p_lid) { return fe_steamlink_closed((float)p_lid); }
+
+LEAN_EXPORT lean_obj_res fe_lean_steamlink_messages(b_lean_obj_arg p_eyes) {
+  static fe_message messages[16];
+  fe_eyes e = read_eyes(p_eyes);
+  return messages_array(messages, fe_steamlink_messages(&e, messages));
+}
+
+LEAN_EXPORT lean_obj_res fe_lean_gaze_vector(double p_x, double p_y) {
+  fe_vec3 v = fe_gaze_vector((float)p_x, (float)p_y);
+  const float f[3] = {v.x, v.y, v.z};
+  return float_array(f, 3);
+}
+
+LEAN_EXPORT lean_obj_res fe_lean_native_messages(b_lean_obj_arg p_eyes, uint8_t p_independent) {
+  static fe_message messages[4];
+  fe_eyes e = read_eyes(p_eyes);
+  return messages_array(messages, fe_native_messages(&e, p_independent != 0, messages));
+}
+
+LEAN_EXPORT lean_obj_res fe_lean_active_message(b_lean_obj_arg p_prefix, uint8_t p_active, uint32_t p_type) {
+  static fe_message message;
+  fe_text prefix = text_of(p_prefix);
+  bool has = fe_active_message(&prefix, p_active != 0, (int32_t)p_type, &message);
+  return messages_array(&message, has ? 1 : 0);
+}
+
+LEAN_EXPORT double fe_lean_etvr_lid(double p_lid) { return fe_etvr_lid((float)p_lid); }
+
+LEAN_EXPORT lean_obj_res fe_lean_etvr_messages(b_lean_obj_arg p_eyes, b_lean_obj_arg p_prefix) {
+  static fe_message messages[8];
+  fe_eyes e = read_eyes(p_eyes);
+  fe_text prefix = text_of(p_prefix);
+  return messages_array(messages, fe_etvr_messages(&e, &prefix, messages));
+}
+
+LEAN_EXPORT lean_obj_res fe_lean_livelink_shapes(b_lean_obj_arg p_eyes) {
+  float shapes[61];
+  fe_eyes e = read_eyes(p_eyes);
+  fe_livelink_shapes(&e, shapes);
+  return float_array(shapes, 61);
+}
+
+LEAN_EXPORT lean_obj_res fe_lean_livelink_packet(double p_time, b_lean_obj_arg p_shapes) {
+  float shapes[61];
+  read_floats(p_shapes, shapes, 61);
+  uint8_t out[512];
+  int32_t n = fe_livelink_packet(p_time, shapes, out);
+  return bytes_of(out, n > 0 ? (size_t)n : 0);
+}
+
+
+// How many packets the throttle lets through for samples every p_step_us microseconds over
+// p_seconds, with a 20 ms interval; p_planted uses "20 ms since the last send" instead.
+LEAN_EXPORT uint32_t fe_lean_throttle_count(uint32_t p_step_us, uint32_t p_seconds, uint8_t p_planted) {
+  int64_t due = 0;
+  int64_t last = -1000000;
+  uint32_t sent = 0;
+  for (int64_t us = 0; us < (int64_t)p_seconds * 1000000; us += p_step_us) {
+    const int64_t now = us / 1000;
+    if (p_planted) {
+      if (now - last >= 20) {
+        last = now;
+        sent += 1;
+      }
+    } else if (fe_throttle(&due, now, 20)) {
+      sent += 1;
+    }
+  }
+  return sent;
+}
+
 }
