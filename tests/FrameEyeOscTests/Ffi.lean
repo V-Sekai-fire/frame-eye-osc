@@ -83,5 +83,7 @@ namespace FrameEyeOscTests.Ffi
 @[extern "fe_lean_eyecam_decode"] opaque eyecamDecode : @& ByteArray → UInt64 → UInt64 → FloatArray
 @[extern "fe_lean_eyecam_apply"] opaque eyecamApply : @& FloatArray → UInt8 → @& FloatArray → @& FloatArray → FloatArray
 @[extern "fe_lean_eyecam_pupil_cm"] opaque eyecamPupilCm : @& FloatArray → Float
+@[extern "fe_lean_eyecam_read_file"] opaque eyecamReadFile : @& String → UInt64 → UInt64 → FloatArray
+@[extern "fe_lean_pupil_message"] opaque pupilMessage : @& String → UInt8 → Float → ByteArray
 
 end FrameEyeOscTests.Ffi

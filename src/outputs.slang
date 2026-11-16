@@ -279,3 +279,18 @@ public export __extern_cpp int fe_livelink_packet(double p_time, float* p_shapes
     }
     return at;
 }
+
+// FT/v2/PupilDiameterLeft or ...Right, the pupil in centimetres.
+public export __extern_cpp Message fe_pupil_message(Text p_prefix, bool p_right, float p_cm)
+{
+    Text t = prefixed(p_prefix);
+    if (p_right)
+    {
+        text_add(t, "/v2/PupilDiameterRight");
+    }
+    else
+    {
+        text_add(t, "/v2/PupilDiameterLeft");
+    }
+    return float_message(t, p_cm);
+}

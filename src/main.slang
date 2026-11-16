@@ -7,6 +7,7 @@ module main;
 import bridge;
 import config;
 import eye_server;
+import eyecam;
 import kernels;
 import libc;
 import osc;
@@ -36,6 +37,7 @@ struct Options
     Text prefix;
     Text source;
     Text gains;
+    Text eyecam;
     Text home;
     bool anime;
     bool heuristics;
@@ -50,6 +52,7 @@ struct Options
 int usage()
 {
     log_line(text_of("usage: frameeyeosc [--target HOST[:PORT]] [--prefix /FT] [--source PATH]"));
+    log_line(text_of("                   [--eyecam PATH|off]"));
     log_line(text_of("                   [--output vrchat|etvr|livelink] [--eye-tracking-active bool|float|off]"));
     log_line(text_of("                   [--style reference|anime] [--no-heuristics] [--native] [--steamlink-params]"));
     log_line(text_of("                   [--learn-port PORT] [--gains FILE] [--lost-at COV]"));
@@ -62,6 +65,7 @@ bool parse(int p_argc, uint8_t** p_argv, out Options r_options)
     r_options.prefix = text_of("/FT");
     r_options.source = text_of("/dev/shm/eye-server.mmap");
     r_options.gains = text_empty();
+    r_options.eyecam = text_of("/run/user/1000/eyecam/live");
     r_options.home = text_empty();
     r_options.anime = false;
     r_options.heuristics = true;
@@ -103,6 +107,10 @@ bool parse(int p_argc, uint8_t** p_argv, out Options r_options)
         else if (text_equals(a, "--prefix"))
         {
             r_options.prefix = v;
+        }
+        else if (text_equals(a, "--eyecam"))
+        {
+            r_options.eyecam = text_equals(v, "off") ? text_empty() : v;
         }
         else if (text_equals(a, "--source"))
         {
@@ -401,6 +409,7 @@ struct Driver
     double last_time;
     int64_t refreshed_at;
     int64_t saved_at;
+    CamSource cam;
 };
 
 void use_plan(inout Driver r_driver, int p_count)
@@ -449,6 +458,8 @@ void driver_init(inout Driver r_driver, Options p_options, Gains p_gains)
     r_driver.last_time = 0.0;
     r_driver.refreshed_at = 0;
     r_driver.saved_at = 0;
+    r_driver.cam.map = (uint8_t*)0;
+    r_driver.cam.opened_ns = 0;
 }
 
 void driver_learn(inout Driver r_driver, Message p_message, int64_t p_now)
@@ -519,6 +530,16 @@ void driver_send(inout Driver r_driver, Sample p_sample, int64_t p_now, int p_fd
     output.right = fe_style_eye(r_driver.tuning, r_driver.gains, h, r_driver.calib.right, input.right.openness,
                                 r_driver.state.right, output.right);
 
+    CamPage cam;
+    cam.status = CAM_SHORT;
+    cam.left = cam_blank();
+    cam.right = cam_blank();
+    if (r_driver.options.eyecam.size > 0)
+    {
+        cam = cam_poll(r_driver.cam, r_driver.options.eyecam, CAM_MAX_AGE_NS);
+    }
+    output.left = fe_eyecam_apply(r_driver.gains, h, output.left, cam.left);
+    output.right = fe_eyecam_apply(r_driver.gains, h, output.right, cam.right);
     bool refresh = p_now - r_driver.refreshed_at >= 1000;
     if (refresh)
     {
@@ -549,6 +570,17 @@ void driver_send(inout Driver r_driver, Sample p_sample, int64_t p_now, int p_fd
         r_driver.last[k] = m.args[0];
         r_driver.has_last[k] = true;
         send_message(p_fd, m, p_scratch);
+    }
+    if (r_driver.options.output == OUTPUT_VRCHAT)
+    {
+        if (cam.left.usable == 1)
+        {
+            send_message(p_fd, fe_pupil_message(r_driver.options.prefix, false, fe_eyecam_pupil_cm(cam.left)), p_scratch);
+        }
+        if (cam.right.usable == 1)
+        {
+            send_message(p_fd, fe_pupil_message(r_driver.options.prefix, true, fe_eyecam_pupil_cm(cam.right)), p_scratch);
+        }
     }
     send_outputs(r_driver.options, eyes, p_now, p_fd, p_scratch);
 }

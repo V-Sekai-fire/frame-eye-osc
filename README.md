@@ -17,7 +17,7 @@ The build needs `slangc` on the `PATH`; run the `frameeyeosc` it writes on the h
 
 ## Eye cameras
 
-`tools/eyecam` is the sasaken1102r eye-camera recorder and live processor (MIT, with the NOTICE of the code it ports). `src/eyecam.slang` reads the page it publishes at `/run/user/1000/eyecam/live` and lets its lid, widen, squint and pupil replace the eye server's openness. `tests/Main.lean` holds the golden page and the invariants; `tests/planted_eyecam.py` plants one defect at a time and requires the named check to fail. The tests build on Linux only.
+`tools/eyecam` is the sasaken1102r eye-camera recorder and live processor (MIT, with the NOTICE of the code it ports). `src/eyecam.slang` reads the page it publishes at `/run/user/1000/eyecam/live` and lets its lid, widen, squint and pupil replace the eye server's openness. `tests/Main.lean` holds the golden page and the invariants; `tests/planted_eyecam.py` plants one defect at a time and requires the named check to fail. `--eyecam PATH|off` (default `/run/user/1000/eyecam/live`) turns the reader on in the anime style: the cameras' lid, widen and squint replace the eye server's, and `FT/v2/PupilDiameterLeft` and `Right` are sent. The reference style does not read it yet. The tests build on Linux only.
 
 ## Licence
 

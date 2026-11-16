@@ -821,4 +821,21 @@ LEAN_EXPORT double fe_lean_eyecam_pupil_cm(b_lean_obj_arg p_cam) {
   return fe_eyecam_pupil_cm(&cam);
 }
 
+LEAN_EXPORT lean_obj_res fe_lean_eyecam_read_file(b_lean_obj_arg p_path, uint64_t p_now_ns, uint64_t p_max_age_ns) {
+  fe_text path = text_of(p_path);
+  fe_cam_page page = fe_eyecam_read_file(&path, p_now_ns, p_max_age_ns);
+  double out[19];
+  out[0] = page.status;
+  cam_eye_array(page.left, out + 1);
+  cam_eye_array(page.right, out + 10);
+  lean_object *array = lean_alloc_sarray(sizeof(double), 19, 19);
+  std::memcpy(lean_float_array_cptr(array), out, sizeof out);
+  return array;
+}
+
+LEAN_EXPORT lean_obj_res fe_lean_pupil_message(b_lean_obj_arg p_prefix, uint8_t p_right, double p_cm) {
+  fe_text prefix = text_of(p_prefix);
+  return byte_array(fe_pupil_message(&prefix, p_right != 0, (float)p_cm));
+}
+
 }  // extern "C"

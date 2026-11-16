@@ -242,6 +242,8 @@ int32_t fe_eye_dominant(const fe_source *p_source);
 void fe_eye_close(fe_source *r_source);
 bool fe_sample_valid(const fe_sample *p_sample);
 fe_message fe_tracking_active(const fe_text *p_prefix, bool p_active);
+fe_cam_page fe_eyecam_read_file(const fe_text *p_path, uint64_t p_now_ns, uint64_t p_max_age_ns);
+fe_message fe_pupil_message(const fe_text *p_prefix, bool p_right, float p_cm);
 void fe_reference_messages(const fe_sample *p_sample, const fe_text *p_prefix, fe_message *r_messages);
 
 float fe_steamlink_closed(float p_lid);

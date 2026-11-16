@@ -6,6 +6,8 @@
 // eye server's own openness. The page layout follows sasaken1102r's frameeyeosc fork.
 module eyecam;
 import kernels;
+import libc;
+import text;
 
 public static const int CAM_OK = 0;
 public static const int CAM_SHORT = 1;
@@ -22,6 +24,9 @@ static const int SEQ_AT = 24;
 static const int LIVE_AT = 52;
 static const int EYE_AT = 56;
 static const int EYE_BYTES = 72;
+
+// A frame older than this is not used.
+public static const uint64_t CAM_MAX_AGE_NS = 100000000;
 
 public struct CamEye
 {
@@ -60,7 +65,7 @@ float cam_f32(uint8_t* p_bytes, int p_offset)
     return asfloat(cam_u32(p_bytes, p_offset));
 }
 
-CamEye cam_blank()
+public CamEye cam_blank()
 {
     CamEye e;
     e.usable = 0;
@@ -198,4 +203,115 @@ public export __extern_cpp float fe_eyecam_pupil_cm(CamEye p_cam)
         return 0.0;
     }
     return clamp(p_cam.pupil_mm / 10.0, 0.0, 1.0);
+}
+
+// The page is read from its file through a mapping kept open between samples.
+public struct CamSource
+{
+    public uint8_t* map;
+    public int64_t opened_ns;
+};
+
+public int64_t cam_now_ns()
+{
+    TimeSpec t = { 0, 0 };
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.seconds * 1000000000 + t.nanoseconds;
+}
+
+public bool cam_open(Text p_path, out CamSource r_source)
+{
+    r_source.map = (uint8_t*)0;
+    r_source.opened_ns = cam_now_ns();
+    int fd = open(&p_path.bytes[0], O_RDONLY | O_CLOEXEC, 0);
+    if (fd < 0)
+    {
+        return false;
+    }
+    uint8_t* m = mmap((uint8_t*)0, uint64_t(PAGE_BYTES), PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
+    if ((int64_t)m == -1)
+    {
+        return false;
+    }
+    r_source.map = m;
+    return true;
+}
+
+public void cam_close(inout CamSource r_source)
+{
+    if ((int64_t)r_source.map != 0)
+    {
+        munmap(r_source.map, uint64_t(PAGE_BYTES));
+    }
+    r_source.map = (uint8_t*)0;
+}
+
+// Copies the page under its seqlock (an odd or changed sequence is retried) and decodes the copy.
+public CamPage cam_read(CamSource p_source, int64_t p_now_ns, uint64_t p_max_age_ns)
+{
+    uint8_t copy[PAGE_BYTES];
+    for (int attempt = 0; attempt < 8; attempt++)
+    {
+        uint32_t before = cam_u32(p_source.map, SEQ_AT);
+        if ((before & 1) != 0)
+        {
+            continue;
+        }
+        for (int k = 0; k < PAGE_BYTES; k++)
+        {
+            copy[k] = p_source.map[k];
+        }
+        if (cam_u32(p_source.map, SEQ_AT) == before)
+        {
+            return fe_eyecam_decode(&copy[0], PAGE_BYTES, uint64_t(p_now_ns), p_max_age_ns);
+        }
+    }
+    CamPage page;
+    page.status = CAM_WRITING;
+    page.left = cam_blank();
+    page.right = cam_blank();
+    return page;
+}
+
+// Reads the page file once: the status is CAM_SHORT when it cannot be opened.
+public export __extern_cpp CamPage fe_eyecam_read_file(Text p_path, uint64_t p_now_ns, uint64_t p_max_age_ns)
+{
+    CamSource s;
+    if (!cam_open(p_path, s))
+    {
+        CamPage page;
+        page.status = CAM_SHORT;
+        page.left = cam_blank();
+        page.right = cam_blank();
+        return page;
+    }
+    CamPage page = cam_read(s, int64_t(p_now_ns), p_max_age_ns);
+    cam_close(s);
+    return page;
+}
+
+// Reads the live page, opening it if need be and reopening about once a second while no eye is
+// usable (the writer replaces the file on restart, so an old mapping goes stale).
+public CamPage cam_poll(inout CamSource r_source, Text p_path, uint64_t p_max_age_ns)
+{
+    int64_t now = cam_now_ns();
+    if ((int64_t)r_source.map == 0 && now - r_source.opened_ns >= 1000000000)
+    {
+        cam_open(p_path, r_source);
+    }
+    CamPage page;
+    page.status = CAM_SHORT;
+    page.left = cam_blank();
+    page.right = cam_blank();
+    if ((int64_t)r_source.map == 0)
+    {
+        return page;
+    }
+    page = cam_read(r_source, now, p_max_age_ns);
+    if (page.left.usable == 0 && page.right.usable == 0 && now - r_source.opened_ns >= 1000000000)
+    {
+        cam_close(r_source);
+    }
+    return page;
 }

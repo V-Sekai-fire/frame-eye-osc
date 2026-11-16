@@ -561,6 +561,29 @@ def eyecamTailBreaks (broken : Bool) (c : Nat) : Bool :=
   let b := decodeAt (pageOf goodHeader (if broken then freshRight else freshLeft) freshRight fill) goldenNow goldenMaxAge
   !sameFloats a b
 
+def eyecamFileChecks : IO (List (String × Bool)) := do
+  let dir := "/tmp/feo-eyecam-file"
+  IO.FS.createDirAll dir
+  let path := s!"{dir}/live"
+  let page := pageOf goodHeader freshLeft freshRight 0x5A
+  IO.FS.writeBinFile path page
+  let fromFile := Ffi.eyecamReadFile path goldenNow goldenMaxAge
+  let odd := pageOf (goodHeader.set 3 7.0) freshLeft freshRight
+  IO.FS.writeBinFile s!"{dir}/odd" odd
+  let busy := Ffi.eyecamReadFile s!"{dir}/odd" goldenNow goldenMaxAge
+  let missing := Ffi.eyecamReadFile s!"{dir}/absent" goldenNow goldenMaxAge
+  let pl := Ffi.pupilMessage "/FT" 0 0.25
+  let pr := Ffi.pupilMessage "/FT/" 1 0.5
+  pure [
+    ("the page read from a real file equals the same bytes decoded in memory",
+      sameFloats fromFile (decodeAt page goldenNow goldenMaxAge) && statusOf fromFile == 0.0 && usableL fromFile == 1.0),
+    ("a file whose sequence is odd is refused after the retries", statusOf busy == 5.0 && usableL busy == 0.0),
+    ("a file that is not there reads as refused with no usable eye", statusOf missing == 1.0 && usableL missing == 0.0 && usableR missing == 0.0),
+    ("golden pupil messages: address under the prefix, one float",
+      Ffi.messageAddress pl == "/avatar/parameters/FT/v2/PupilDiameterLeft" && Ffi.messageFloat pl 0 == 0.25 &&
+      Ffi.messageAddress pr == "/avatar/parameters/FT/v2/PupilDiameterRight" && Ffi.messageFloat pr 0 == 0.5 &&
+      tagOf pl == 'f') ]
+
 def properties : List (String × (Bool → Nat → Bool)) := [
   ("weights in 0..1 and axes in -1..1 (control: both lids always equal)", rangeBreaks),
   ("blink and wide never both nonzero (control: wide from a neutral 0.2 lower)", exclusionBreaks),
@@ -585,8 +608,9 @@ def main : IO UInt32 := do
   let unit := gazeChecks ++ referenceChecks ++ recordChecks ++ oscChecks ++ expressionChecks ++ animeChecks ++ paramChecks ++
     outputChecks ++ eyecamChecks
   let io ← ioChecks
+  let camFile ← eyecamFileChecks
   let mut bad := 0
-  for (name, ok) in unit ++ io do
+  for (name, ok) in unit ++ io ++ camFile do
     IO.println s!"{if ok then "ok  " else "FAIL"} {name}"
     unless ok do bad := bad + 1
   for (name, breaks) in properties do
@@ -596,5 +620,5 @@ def main : IO UInt32 := do
     let controlOk := match control.outcome with | .found _ => true | _ => false
     IO.println s!"{if realOk && controlOk then "ok  " else "FAIL"} {name}: real {repr real.outcome}, control {repr control.outcome}"
     unless realOk && controlOk do bad := bad + 1
-  IO.println s!"{(unit ++ io).length} checks and {properties.length} properties, {bad} failures"
+  IO.println s!"{(unit ++ io ++ camFile).length} checks and {properties.length} properties, {bad} failures"
   return if bad == 0 then 0 else 1

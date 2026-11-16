@@ -17,6 +17,8 @@ SCRATCH = os.environ.get("PLANT_DIR", "/tmp/feo-planted")
 
 # The future-stamp guard in cam_eye has no mutant: with it removed, the unsigned p_now_ns - t wraps to
 # a huge age and the frame is still refused, so that mutant is equivalent to the original.
+# The seqlock retry in cam_read has no mutant: an odd sequence is refused by fe_eyecam_decode too, and a torn
+# copy needs a concurrent writer, which a static file cannot make. That path is untested.
 # (name, text in src/eyecam.slang, replacement, substring the failing line must contain)
 MUTANTS = [
     ("magic not checked", "if (cam_u32(p_page, 0) != PAGE_MAGIC)", "if (false)", "a wrong magic is refused"),
@@ -40,6 +42,8 @@ MUTANTS = [
      "if (p_cam.usable != 1)\n    {\n        p_base.lid = 0.0;\n        return p_base;", "an unusable frame leaves the base eye"),
     ("brows ignore heuristics off", "    if (p_heuristics)\n    {\n        o.cheek_squint", "    if (true)\n    {\n        o.cheek_squint",
      "without heuristics the squint stays"),
+    ("right pupil sent to the left address", 'text_add(t, "/v2/PupilDiameterRight");', 'text_add(t, "/v2/PupilDiameterLeft");',
+     "golden pupil messages", "outputs.slang"),
     ("pupil not clamped", "clamp(p_cam.pupil_mm / 10.0, 0.0, 1.0)", "p_cam.pupil_mm / 10.0", "pupil centimetres stay in 0..1"),
 ]
 
@@ -57,8 +61,7 @@ def main():
         shutil.rmtree(SCRATCH)
     shutil.copytree(ROOT, SCRATCH, ignore=shutil.ignore_patterns(".lake", "build", ".git"))
     tests_dir = os.path.join(SCRATCH, "tests")
-    target = os.path.join(SCRATCH, "src", "eyecam.slang")
-    original = open(target).read()
+    originals = {}
     code, out = run_tests(tests_dir)
     if code != 0:
         print("FAIL the unmutated tree does not pass; no mutant can be judged")
@@ -67,7 +70,10 @@ def main():
     clean_lines = out.count("\nok   ")
     print(f"ok   clean tree passes ({clean_lines} ok lines)")
     bad = 0
-    for name, old, new, expect in MUTANTS:
+    for entry in MUTANTS:
+        name, old, new, expect = entry[:4]
+        target = os.path.join(SCRATCH, "src", entry[4] if len(entry) > 4 else "eyecam.slang")
+        original = originals.setdefault(target, open(target).read())
         if original.count(old) != 1:
             print(f"FAIL {name}: the text to replace matches {original.count(old)} times, not once")
             bad += 1
@@ -76,6 +82,7 @@ def main():
         assert mutated != original
         open(target, "w").write(mutated)
         code, out = run_tests(tests_dir)
+        open(target, "w").write(original)
         failing = [line for line in out.splitlines() if line.startswith("FAIL")]
         if code is None:
             print(f"FAIL {name}: the build broke instead of the test failing")
@@ -88,7 +95,6 @@ def main():
             bad += 1
         else:
             print(f"ok   {name}: caught by '{expect}' ({len(failing)} failing lines)")
-    open(target, "w").write(original)
     print(f"{len(MUTANTS)} planted defects, {bad} not caught")
     return 1 if bad else 0
 
