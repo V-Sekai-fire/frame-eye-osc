@@ -79,4 +79,9 @@ namespace FrameEyeOscTests.Ffi
 
 @[extern "fe_lean_calib_round_trip"] opaque calibRoundTrip : @& String → @& FloatArray → IO FloatArray
 
+@[extern "fe_lean_eyecam_page"] opaque eyecamPage : @& FloatArray → @& FloatArray → @& FloatArray → UInt8 → ByteArray
+@[extern "fe_lean_eyecam_decode"] opaque eyecamDecode : @& ByteArray → UInt64 → UInt64 → FloatArray
+@[extern "fe_lean_eyecam_apply"] opaque eyecamApply : @& FloatArray → UInt8 → @& FloatArray → @& FloatArray → FloatArray
+@[extern "fe_lean_eyecam_pupil_cm"] opaque eyecamPupilCm : @& FloatArray → Float
+
 end FrameEyeOscTests.Ffi

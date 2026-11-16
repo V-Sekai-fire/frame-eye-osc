@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include <cstring>
+#include <vector>
 
 namespace {
 
@@ -711,3 +712,113 @@ LEAN_EXPORT uint32_t fe_lean_throttle_count(uint32_t p_step_us, uint32_t p_secon
 }
 
 }
+
+// ── The eye cameras' page (tools/eyecam, version 1) ──────────────────────────
+
+namespace {
+
+void put_u32(std::vector<uint8_t> &r_page, size_t p_at, uint32_t p_value) {
+  std::memcpy(r_page.data() + p_at, &p_value, sizeof p_value);
+}
+
+void put_u64(std::vector<uint8_t> &r_page, size_t p_at, uint64_t p_value) {
+  std::memcpy(r_page.data() + p_at, &p_value, sizeof p_value);
+}
+
+void put_f32(std::vector<uint8_t> &r_page, size_t p_at, double p_value) {
+  const float f = (float)p_value;
+  std::memcpy(r_page.data() + p_at, &f, sizeof f);
+}
+
+// eye = [t_mono_ns, valid, closed, lid, wide, squint, pupil_ratio, pupil_mm, pupil_dilation, confidence]
+void put_eye(std::vector<uint8_t> &r_page, size_t p_at, b_lean_obj_arg p_eye) {
+  double e[10];
+  size_t n = lean_sarray_size(p_eye);
+  const double *values = lean_float_array_cptr(p_eye);
+  for (size_t k = 0; k < 10; ++k) {
+    e[k] = k < n ? values[k] : 0.0;
+  }
+  put_u64(r_page, p_at, (uint64_t)e[0]);
+  put_u32(r_page, p_at + 24, (uint32_t)e[1]);
+  put_u32(r_page, p_at + 28, (uint32_t)e[2]);
+  for (size_t k = 0; k < 7; ++k) {
+    put_f32(r_page, p_at + 32 + 4 * k, e[3 + k]);
+  }
+}
+
+void cam_eye_array(const fe_cam_eye &p_e, double *r_out) {
+  r_out[0] = p_e.usable;
+  r_out[1] = p_e.closed;
+  r_out[2] = p_e.lid;
+  r_out[3] = p_e.wide;
+  r_out[4] = p_e.squint;
+  r_out[5] = p_e.pupil_ratio;
+  r_out[6] = p_e.pupil_mm;
+  r_out[7] = p_e.pupil_dilation;
+  r_out[8] = p_e.confidence;
+}
+
+fe_cam_eye read_cam_eye(b_lean_obj_arg p_array) {
+  double d[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+  size_t n = lean_sarray_size(p_array);
+  const double *values = lean_float_array_cptr(p_array);
+  for (size_t k = 0; k < 9 && k < n; ++k) {
+    d[k] = values[k];
+  }
+  return fe_cam_eye{(int32_t)d[0], (int32_t)d[1], (float)d[2], (float)d[3], (float)d[4], (float)d[5], (float)d[6], (float)d[7], (float)d[8]};
+}
+
+}  // namespace
+
+extern "C" {
+
+// A 4096-byte page. header = [magic, version, struct_size, seq, live]; the bytes after the 200-byte
+// struct take p_fill, and the left eye sits at 56 and the right at 128 as the layout says.
+LEAN_EXPORT lean_obj_res fe_lean_eyecam_page(b_lean_obj_arg p_header, b_lean_obj_arg p_left, b_lean_obj_arg p_right,
+                                             uint8_t p_fill) {
+  std::vector<uint8_t> page(4096, p_fill);
+  std::memset(page.data(), 0, 200);
+  double h[5] = {0, 0, 0, 0, 0};
+  size_t n = lean_sarray_size(p_header);
+  const double *values = lean_float_array_cptr(p_header);
+  for (size_t k = 0; k < 5 && k < n; ++k) {
+    h[k] = values[k];
+  }
+  put_u32(page, 0, (uint32_t)h[0]);
+  put_u32(page, 4, (uint32_t)h[1]);
+  put_u32(page, 8, (uint32_t)h[2]);
+  put_u32(page, 24, (uint32_t)h[3]);
+  put_u32(page, 52, (uint32_t)h[4]);
+  put_eye(page, 56, p_left);
+  put_eye(page, 128, p_right);
+  lean_object *out = lean_alloc_sarray(1, page.size(), page.size());
+  std::memcpy(lean_sarray_cptr(out), page.data(), page.size());
+  return out;
+}
+
+// [status, left usable, closed, lid, wide, squint, ratio, mm, dilation, confidence, then the right eye].
+LEAN_EXPORT lean_obj_res fe_lean_eyecam_decode(b_lean_obj_arg p_page, uint64_t p_now_ns, uint64_t p_max_age_ns) {
+  fe_cam_page page = fe_eyecam_decode(lean_sarray_cptr(p_page), (int32_t)lean_sarray_size(p_page), p_now_ns, p_max_age_ns);
+  double out[19];
+  out[0] = page.status;
+  cam_eye_array(page.left, out + 1);
+  cam_eye_array(page.right, out + 10);
+  lean_object *array = lean_alloc_sarray(sizeof(double), 19, 19);
+  std::memcpy(lean_float_array_cptr(array), out, sizeof out);
+  return array;
+}
+
+LEAN_EXPORT lean_obj_res fe_lean_eyecam_apply(b_lean_obj_arg p_gains, uint8_t p_heuristics, b_lean_obj_arg p_base,
+                                              b_lean_obj_arg p_cam) {
+  fe_gains g = read_struct<fe_gains>(p_gains);
+  fe_eye_out base = read_struct<fe_eye_out>(p_base);
+  fe_cam_eye cam = read_cam_eye(p_cam);
+  return struct_array(fe_eyecam_apply(&g, p_heuristics != 0, &base, &cam));
+}
+
+LEAN_EXPORT double fe_lean_eyecam_pupil_cm(b_lean_obj_arg p_cam) {
+  fe_cam_eye cam = read_cam_eye(p_cam);
+  return fe_eyecam_pupil_cm(&cam);
+}
+
+}  // extern "C"

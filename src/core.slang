@@ -5,6 +5,7 @@ module core;
 
 import bridge;
 import config;
+import eyecam;
 import eye_server;
 import kernels;
 import osc;

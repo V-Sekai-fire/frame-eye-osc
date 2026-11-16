@@ -430,6 +430,137 @@ def query (name : String) (breaks : Nat → Bool) : IO TraceEntry := do
   let (_, _, trace) ← resolve name (fun _ c => breaks c) readback
   pure trace
 
+-- ── The eye cameras' page: golden, invariant and control checks ──────────────
+/-- 200 bytes written by an independent Python `struct.pack` from the layout table in
+`tools/eyecam/README.md` (magic, version 1, size 200, seq 6, live 1; left eye lid 0.75, wide 0.5,
+squint 0.25, pupil 2.5 mm, stamped 1 000 000 ns; right eye closed, stamped 999 900 ns). -/
+def goldenPage : ByteArray := bytes [69, 89, 67, 77, 1, 0, 0, 0, 200, 0, 0, 0, 146, 16, 0, 0, 232, 3, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 7, 0, 0, 0, 64, 66, 15, 0, 0, 0, 0, 0, 88, 62, 15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 64, 66, 15, 0, 0, 0, 0, 0, 88, 62, 15, 0, 0, 0, 0, 0, 57, 48, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64, 63, 0, 0, 0, 63, 0, 0, 128, 62, 0, 0, 0, 63, 0, 0, 32, 64, 0, 0, 32, 63, 0, 0, 128, 63, 0, 0, 0, 62, 0, 0, 128, 190, 0, 0, 0, 0, 220, 65, 15, 0, 0, 0, 0, 0, 88, 62, 15, 0, 0, 0, 0, 0, 58, 48, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 128, 61, 0, 0, 96, 63, 0, 0, 0, 63, 0, 0, 128, 63, 0, 0, 160, 64, 0, 0, 64, 63, 0, 0, 0, 63, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+def goldenNow : UInt64 := 1000500
+def goldenMaxAge : UInt64 := 1000
+def goldenGains : FloatArray := floats [1.0, 0.5, 0.5, 0.25, 0.5, 0.75]
+def goodHeader : List Float := [1296259397.0, 1.0, 200.0, 6.0, 1.0]
+/-- [t_mono_ns, valid, closed, lid, wide, squint, pupil_ratio, pupil_mm, pupil_dilation, confidence]. -/
+def camEye (t : Float) (valid closed lid wide squint mm : Float) : FloatArray :=
+  floats [t, valid, closed, lid, wide, squint, 0.5, mm, 0.5, 1.0]
+def freshLeft : FloatArray := camEye 1000000.0 1.0 0.0 0.75 0.5 0.25 2.5
+def freshRight : FloatArray := camEye 999900.0 1.0 1.0 0.0625 0.875 0.5 5.0
+def pageOf (h : List Float) (l r : FloatArray) (fill : UInt8 := 0) : ByteArray :=
+  Ffi.eyecamPage (floats h) l r fill
+def decodeAt (page : ByteArray) (now maxAge : UInt64) : FloatArray := Ffi.eyecamDecode page now maxAge
+/-- Decoded layout: [status, then per eye usable, closed, lid, wide, squint, ratio, mm, dilation, confidence]. -/
+def statusOf (d : FloatArray) : Float := get d 0
+def usableL (d : FloatArray) : Float := get d 1
+def usableR (d : FloatArray) : Float := get d 10
+def camOf (d : FloatArray) (right : Bool) : FloatArray :=
+  floats ((List.range 9).map fun k => get d ((if right then 10 else 1) + k))
+def baseEye : FloatArray := Ffi.eye 0 gainsDefault 1 (floats calibDefault) (floats [0.75, 0, 0])
+def sameFloats (a b : FloatArray) : Bool := a.size == b.size && (List.range a.size).all fun k => get a k == get b k
+def eyecamChecks : List (String × Bool) :=
+  let d := decodeAt goldenPage goldenNow goldenMaxAge
+  let left := camOf d false
+  let right := camOf d true
+  let l := Ffi.eyecamApply goldenGains 1 baseEye left
+  let r := Ffi.eyecamApply goldenGains 1 baseEye right
+  let off := Ffi.eyecamApply goldenGains 0 baseEye left
+  let hdr (i : Nat) (v : Float) := (goodHeader.set i v)
+  let status (h : List Float) := statusOf (decodeAt (pageOf h freshLeft freshRight) goldenNow goldenMaxAge)
+  let beyond := decodeAt (pageOf goodHeader freshLeft freshRight 0x00) goldenNow goldenMaxAge
+  let beyondFF := decodeAt (pageOf goodHeader freshLeft freshRight 0xFF) goldenNow goldenMaxAge
+  [ -- Golden: fixed bytes in, exact values out.
+    ("golden page decodes to the values it was written from",
+      sameFloats d (floats [0, 1, 0, 0.75, 0.5, 0.25, 0.5, 2.5, 0.625, 1.0, 1, 1, 0.0625, 0.875, 0.5, 1.0, 5.0, 0.75, 0.5])),
+    ("golden page: the open eye takes its lid, widen and squint, and the brows follow the gains",
+      sameFloats l (floats [get baseEye 0, get baseEye 1, get baseEye 2, get baseEye 3, get baseEye 4, get baseEye 5,
+        0.0, 1.0, 0.5, 0.25, 0.75, 0.125, 0.125, 0.0625, 0.25, 0.375])),
+    ("golden page: the closed eye is shut with no widen, squint or brow",
+      sameFloats r (floats [get baseEye 0, get baseEye 1, get baseEye 2, get baseEye 3, get baseEye 4, get baseEye 5,
+        1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])),
+    ("golden page: without heuristics the squint stays and the brows stay at zero",
+      get off 9 == 0.25 && (List.range 5).all fun k => get off (11 + k) == 0.0),
+    ("golden pupils: 2.5 mm is 0.25 cm and 5 mm is 0.5 cm",
+      Ffi.eyecamPupilCm left == 0.25 && Ffi.eyecamPupilCm right == 0.5),
+    -- Refusals, one per rule of the page contract.
+    ("a short copy is refused", statusOf (decodeAt (goldenPage.extract 0 199) goldenNow goldenMaxAge) == 1.0),
+    ("the good header is read (the refusals below start from it)", status goodHeader == 0.0),
+    ("a wrong magic is refused", status (hdr 0 1296259398.0) == 2.0),
+    ("a version other than 1 is refused", status (hdr 1 2.0) == 3.0 && status (hdr 1 0.0) == 3.0),
+    ("a struct size under 200 is refused", status (hdr 2 199.0) == 4.0),
+    ("a struct size over 200 is read (a later writer may append)", status (hdr 2 256.0) == 0.0),
+    ("an odd sequence is refused as a write in progress", status (hdr 3 7.0) == 5.0),
+    ("an even sequence is read", status (hdr 3 8.0) == 0.0),
+    ("live 0 is refused", status (hdr 4 0.0) == 6.0),
+    -- Freshness at its exact edges.
+    ("a frame exactly max-age old is used, one nanosecond more is not",
+      usableL (decodeAt goldenPage 1001000 goldenMaxAge) == 1.0 && usableL (decodeAt goldenPage 1001001 goldenMaxAge) == 0.0),
+    ("a frame from the future is not used", usableL (decodeAt goldenPage 999999 goldenMaxAge) == 0.0),
+    ("a frame stamped 0 is not used, even when the clock itself is within max-age of 0",
+      usableL (decodeAt (pageOf goodHeader (camEye 0.0 1.0 0.0 0.75 0.5 0.25 2.5) freshRight) 500 goldenMaxAge) == 0.0),
+    ("a valid 0 eye is not used and does not disturb the other", Id.run do
+      let e := decodeAt (pageOf goodHeader (camEye 1000000.0 0.0 0.0 0.75 0.5 0.25 2.5) freshRight) goldenNow goldenMaxAge
+      return usableL e == 0.0 && usableR e == 1.0),
+    ("bytes after the 200-byte struct do not matter", sameFloats beyond beyondFF),
+    ("a refused page leaves the base eye as it was",
+      sameFloats (Ffi.eyecamApply goldenGains 1 baseEye (camOf (decodeAt goldenPage goldenNow 10) false)) baseEye) ]
+def camAt (c : Nat) : FloatArray :=
+  camEye 1000000.0 1.0 (if mix c 90 % 5 == 0 then 1.0 else 0.0) (valueAt c 91 (-2.0) 3.0) (valueAt c 92 (-2.0) 3.0)
+    (valueAt c 93 (-2.0) 3.0) (valueAt c 94 (-5.0) 40.0)
+def camCm (cam : FloatArray) : FloatArray := floats ((List.range 9).map fun k => get cam (1 + k))
+/-- The wild values a producer could write: out of range, NaN or infinite. -/
+def wild (c k : Nat) : Float :=
+  match mix c k % 6 with
+  | 0 => 0.0 / 0.0
+  | 1 => 1.0 / 0.0
+  | 2 => -1.0 / 0.0
+  | _ => valueAt c (k + 1) (-4.0) 4.0
+def camApplied (c : Nat) : FloatArray :=
+  let cam := camAt c
+  let d := decodeAt (pageOf goodHeader cam freshRight) goldenNow goldenMaxAge
+  Ffi.eyecamApply (gainsAt c) 1 baseEye (camOf d false)
+def eyecamRangeBreaks (broken : Bool) (c : Nat) : Bool :=
+  if broken then valueAt c 91 (-2.0) 3.0 > 1.0
+  else !((List.range 10).all fun k => in01 (get (camApplied c) (6 + k)))
+def eyecamExclusionBreaks (broken : Bool) (c : Nat) : Bool :=
+  let o := camApplied c
+  if broken then get o 6 > 0.0 && valueAt c 92 (-2.0) 3.0 > 0.0 else get o 6 > 0.0 && get o 8 > 0.0
+def eyecamIdentityBreaks (broken : Bool) (c : Nat) : Bool :=
+  let cam := camCm (camAt c)
+  let unusable := cam.set! 0 (if broken then 1.0 else 0.0)
+  let o := Ffi.eyecamApply (gainsAt c) 1 baseEye unusable
+  !sameFloats o baseEye
+def eyecamWildBreaks (broken : Bool) (c : Nat) : Bool :=
+  let slot := mix c 95 % 7
+  let w := wild c 96
+  let clean := valueAt c 97 0.0 1.0
+  let eye := floats [1000000.0, 1.0, 0.0, clean, clean, clean, clean, clean, clean, clean]
+  let eye := if broken then eye else eye.set! (3 + slot) w
+  let d := decodeAt (pageOf goodHeader eye freshRight) goldenNow goldenMaxAge
+  if broken then usableL d == 1.0 else usableL d == 1.0 && !w.isFinite
+def eyecamFreshBreaks (broken : Bool) (c : Nat) : Bool :=
+  let maxAge : Nat := 1 + mix c 100 % 5000
+  let age : Nat := match mix c 101 % 4 with | 0 => maxAge | 1 => maxAge + 1 | 2 => maxAge - 1 | _ => mix c 102 % 9000
+  let t : Nat := 2000000
+  let now : Nat := t + age
+  let d := decodeAt (pageOf goodHeader (camEye t.toFloat 1.0 0.0 0.75 0.5 0.25 2.5) freshRight) now.toUInt64 maxAge.toUInt64
+  let expected : Bool := if broken then Nat.blt age maxAge else Nat.ble age maxAge
+  (usableL d == 1.0) != expected
+def eyecamSwapBreaks (broken : Bool) (c : Nat) : Bool :=
+  let l := camEye 1000000.0 1.0 0.0 (valueAt c 110 0.0 1.0) (valueAt c 111 0.0 1.0) (valueAt c 112 0.0 1.0) (valueAt c 113 0.0 9.0)
+  let r := camEye 999900.0 1.0 0.0 (valueAt c 114 0.0 1.0) (valueAt c 115 0.0 1.0) (valueAt c 116 0.0 1.0) (valueAt c 117 0.0 9.0)
+  let a := decodeAt (pageOf goodHeader l r) goldenNow goldenMaxAge
+  let b := decodeAt (pageOf goodHeader r l) goldenNow goldenMaxAge
+  if broken then !(sameFloats (camOf a false) (camOf b false))
+  else !(sameFloats (camOf a false) (camOf b true) && sameFloats (camOf a true) (camOf b false))
+def eyecamPupilBreaks (broken : Bool) (c : Nat) : Bool :=
+  let mm := valueAt c 120 (-20.0) 80.0
+  let cam := floats [1, 0, 0.5, 0.5, 0.5, 0.5, mm, 0.5, 1.0]
+  let cm := Ffi.eyecamPupilCm cam
+  if broken then mm / 10.0 > 1.0 else !(0.0 ≤ cm && cm ≤ 1.0 && (mm < 0.0 || mm > 10.0 || cm == (mm.toFloat32 / (10.0 : Float32)).toFloat))
+def eyecamTailBreaks (broken : Bool) (c : Nat) : Bool :=
+  let fill := (mix c 130 % 256).toUInt8
+  let a := decodeAt (pageOf goodHeader freshLeft freshRight 0x00) goldenNow goldenMaxAge
+  let b := decodeAt (pageOf goodHeader (if broken then freshRight else freshLeft) freshRight fill) goldenNow goldenMaxAge
+  !sameFloats a b
+
 def properties : List (String × (Bool → Nat → Bool)) := [
   ("weights in 0..1 and axes in -1..1 (control: both lids always equal)", rangeBreaks),
   ("blink and wide never both nonzero (control: wide from a neutral 0.2 lower)", exclusionBreaks),
@@ -437,14 +568,22 @@ def properties : List (String × (Bool → Nat → Bool)) := [
   ("the anime layer keeps every channel in 0..1 (control: squint without its clamp)", styleBreaks),
   ("expressive gaze is odd, bounded and monotone (control: gain without the tanh limit)", expressiveBreaks),
   ("gaze stays in -1..1 and mirrors (control: angle without the clamp)", gazeBreaks),
-  ("OSC messages round-trip word-aligned (control: last byte dropped)", oscBreaks) ]
+  ("OSC messages round-trip word-aligned (control: last byte dropped)", oscBreaks),
+  ("eye cameras: every output stays in 0..1 (control: lid passed through unclamped)", eyecamRangeBreaks),
+  ("eye cameras: blink and wide never both nonzero (control: wide copied while shut)", eyecamExclusionBreaks),
+  ("eye cameras: an unusable frame leaves the base eye as it was (control: a usable frame changes it)", eyecamIdentityBreaks),
+  ("eye cameras: a non-finite value makes the eye unusable (control: only finite values)", eyecamWildBreaks),
+  ("eye cameras: max-age is inclusive to the nanosecond (control: exclusive edge)", eyecamFreshBreaks),
+  ("eye cameras: swapping the page's eyes swaps the decoded eyes (control: not swapped)", eyecamSwapBreaks),
+  ("eye cameras: pupil centimetres stay in 0..1 (control: no clamp)", eyecamPupilBreaks),
+  ("eye cameras: bytes past the struct never change the decode (control: a different eye)", eyecamTailBreaks) ]
 
 end FrameEyeOscTests
 
 open FrameEyeOscTests in
 def main : IO UInt32 := do
   let unit := gazeChecks ++ referenceChecks ++ recordChecks ++ oscChecks ++ expressionChecks ++ animeChecks ++ paramChecks ++
-    outputChecks
+    outputChecks ++ eyecamChecks
   let io ← ioChecks
   let mut bad := 0
   for (name, ok) in unit ++ io do

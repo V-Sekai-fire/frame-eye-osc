@@ -1,0 +1,2039 @@
+//! Per-eye, per-frame classical features: a port of tools/eyecam/analysis/feat2.py (the "base" variant the
+//! cross-wear evaluation chose). Works on upright 400x400 frames (the left eye flipped vertically, see
+//! `vision::UPSIDE_DOWN_EYE`).
+//!
+//! Pipeline: grey opening 9x9 (removes glints) -> darkest compact blob = pupil -> 64 rays from the blob centre,
+//! sub-pixel pupil->iris crossing, robust ellipse (diameter = 2a) -> iris radius from the limbus -> upper lid
+//! "skin line" (bright skin -> dark band, DP path along the vertical gradient, pupil masked) and its margin below,
+//! lower lid (dark -> bright skin) -> box brightness where the iris should be (closed lids are bright skin).
+//!
+//! Numerical details follow the prototype (numpy's int() truncation, banker's rounding, percentile interpolation,
+//! first-index argmin/argmax) so features agree with it; see the agreement report in the README.
+
+use crate::vision::{self, CcBufs, Component, Ellipse, GaussBufs, H, MorphBufs, Quad, Rect, W};
+
+const NRAY: usize = 64;
+/// Median margin - skin line offset (px) when the margin itself is not found (feat2.MARGIN_OFF).
+pub const MARGIN_OFF: f64 = 7.0;
+/// Left edge of every search region in the prototype. The small-x side of both upright images is the TEMPORAL side
+/// (toward the ear: a pupil moves toward it as the eye turns outward, and toward large x as it turns inward; the
+/// 2026-10-09 recordings against Valve's gaze); it is dark shading there, as dark as the pupil.
+pub const X_MIN: f64 = 186.0;
+/// The live search's left edge adapts per wear (`search_x_min`) within these bounds.
+pub const X_MIN_LO: f64 = 100.0;
+/// The rows the pupil is looked for in (from, to; the window's x runs from the left edge to the lens edge). The panel's
+/// eye preview draws the window too (preview.rs).
+pub const SEARCH_Y0: usize = 70;
+pub const SEARCH_Y1: usize = 320;
+/// The prototype's opening is computed from this column on (exact from 8 columns further), the blurred image from
+/// OPF_X0. The leftmost samples ever taken are the iris rays on the temporal side, 95 px left of a pupil that is right
+/// of X_MIN. The live search starts them `OPEN_BEFORE` columns left of its own left edge instead (room for a pupil
+/// centred up to 20 px left of it, cut by the window; each 10 columns cost about 1% of the frame time).
+const OPEN_X0: usize = 72;
+const OPF_X0: usize = 80;
+const OPEN_BEFORE: usize = 124;
+/// Blobs refined per frame in the live search (in score order; the first that refines is the pupil).
+const MAX_CANDIDATES: usize = 3;
+/// A blob that touches the search window's left edge only counts as a pupil when at least this share of the rays
+/// pointing left (outside the window) find the pupil's edge: dark shading cut by the window has no edge there.
+const EDGE_LEFT_SHARE: f64 = 0.4;
+/// The second search without the prior only looks at blobs at least this far (px) from it.
+const RETRY_MIN_JUMP: f64 = 40.0;
+/// The iris radius's rays toward large x take the strongest dark -> bright rise. Where something brighter than the
+/// sclera lies beyond it (a prescription insert's glare band that is not saturated, so `glare_columns` does not see
+/// it), that edge can be the stronger one and the radius comes out far too large: issue 38's right eye was calibrated
+/// at R 88 px (left 40.8, its pupil 1.2 x the left one's), which doubles the iris box and the lid bands. With
+/// `Extractor::iris_first` an earlier rise at least IRIS_FIRST_SHARE as strong, the gradient falling below IRIS_VALLEY
+/// of it in between, is taken as the limbus instead.
+/// Replays with the first-rise fit on from the start (26 recordings, a picture shifted up 25 px with a nasal band of
+/// 235 from x 300 that pulls the fit out to a median of 79 / 75 px, against 61 / 54 without): at 0.35 the radius came
+/// back to 62 / 58 px, closes missed in free use 1.27 -> 0.84 a minute, squint 0.81 -> 0.87, widen 0.72 -> 0.80, but
+/// false half-shut 5.3% -> 7.9%; at 0.5, 73 / 68 px and 1.06 a minute. On the original recordings it changed little
+/// (closes missed 0.39 -> 0.40 a minute), and the switch itself never happens there.
+const IRIS_FIRST_SHARE: f64 = 0.35;
+const IRIS_VALLEY: f64 = 0.5;
+/// A pupil from the extended search (`Search::find_x_min`) must have its small-x (temporal) edge left of `x_min` +
+/// this many px: one further in is for the search inside `x_min` to find, and is not taken from the extended one (the
+/// same distance as `live::EDGE_LOST_PX`).
+pub const EXT_EDGE_PX: f64 = 16.0;
+/// The largest pupil semi-axis (px) the extended search looks for (`refine_pupil` takes up to 60).
+const EXT_MAX_A: f64 = 60.0;
+/// An upper lid line whose path runs along its search band's first or last LID_EDGE_ROWS + 1 rows for at least
+/// LID_EDGE_SHARE of its inlier columns is not a line at all: with nothing to follow in the band, the path is pushed
+/// against one of its edges. With the pupil seen, such a frame has no upper lid line (`Features::upper_edge`; live
+/// holds the last values, a calibration leaves the frame out). One wearer's widened lid (2026-10-17, a 0.7.9 wear
+/// calibration) left the band above for whole widen steps: the left eye's line sat on the band's bottom row
+/// (-0.43 to -0.47 R, under the pupil centre) in 302 of 396 widen frames and read as an eye almost shut. The
+/// developer's 84 calibrations have no frame at either edge (lines within -0.40 .. 1.5 R, the band -0.43 .. 2.1).
+/// Not without the pupil: a closing lid really does come down to the band's bottom.
+pub const LID_EDGE_SHARE: f64 = 0.5;
+const LID_EDGE_ROWS: usize = 1;
+/// The lower lid line has the same rule at the far (bottom) edge of its band only, with or without the pupil: a line
+/// pushed against cy + 1.9 r is no lower lid, while a closing eye's lines do meet at the band's top. The developer's
+/// recordings: lower lines with the pupil within 0.40 .. 1.44 r of its centre, without it 0.19% of frames past 1.8 r.
+/// The engine uses the last lower line seen with the pupil instead (and for one found without the pupil far below it,
+/// live::LOWER_DROP_MAX).
+/// And the upper line cannot be below the pupil's centre while the pupil is seen whole (UPPER_WHOLE_VIS of its rays
+/// reach its edge: a lid that low hides its upper half): the same wearer's left eye had its upper line at -0.25 r, under
+/// the centre, on more than half of its widen frames; the developer's recordings, 0.001% of such frames.
+const UPPER_WHOLE_VIS: f64 = 0.75;
+/// With the pupil seen whole, a line found lower than ABOVE_PUPIL_B of its minor semi-axis above its centre is searched
+/// for again above the pupil (rows from the band's top to ABOVE_PUPIL_PX px above the pupil), and the line found there
+/// replaces it if it is not pushed against that band's edge and its inlier share is at least the first one's: a
+/// stronger bright -> dark step lower down took the search there. It was 0.5 b up to 0.8.2-beta.3: on a wide-open eye
+/// the first line can sit on the pupil's own blurred top edge, 1.05 to 1.21 b above its centre (two recordings from
+/// someone wearing prescription inserts, 2026-10-25: the failing widen frames' lines, the median at 1.13 b), which 0.5
+/// b never searched again, and the widened eye read half-shut (EyeLid under 0.5 in 37.1% / 15.8% of the widen frames,
+/// left / right; 5.0% / 3.6% at 1.2 b, widen recall 0.592 -> 0.917). On the developer's 26 recordings and 10
+/// calibrations 1.2 b changes none of the outputs' measures (half-shut, squint, blinks); higher, the search runs on
+/// more and more shallow squints, where a lid that grazes the pupil's top (vis still over UPPER_WHOLE_VIS) has its edge
+/// outside the second band, which then takes a crease or the lashes above: at 1.3 b on 61% of the developer's squint
+/// frames, and 1.4 b loses 0.47 pt of squint and a blink.
+/// A tester with lens inserts (a recording of 2026-10-23, a brightly lit sclera and glints from the inserts, long upper
+/// lashes) had the line under the pupil's centre in 76% / 77% of the normal frames and 86% / 96% of the widen frames,
+/// and most of the rest just above the centre: live read the widened eye as nearly shut (skin line 0.05 R), and its
+/// wear calibration had a line in 368 / 350 of 1512 normal frames. Searched above the pupil, the line is on the lid's
+/// edge in the normal frames (0.83 / 0.76, in 1419 / 1501 of them) and on the lid's edge or the iris's top when widened
+/// (1.35 / 1.26): a widen step of 0.52 / 0.51.
+const ABOVE_PUPIL_PX: f64 = 2.0;
+const ABOVE_PUPIL_B: f64 = 1.2;
+/// The calibration's second, higher search band for a widened upper lid (`Extractor::upper_high`): rows from
+/// cy - HIGH_BAND.0 r to cy - HIGH_BAND.1 r (the usual band is cy - 2.1 r .. cy + 0.45 r). See live::widen_fit.
+pub const HIGH_BAND: (f64, f64) = (3.2, 1.6);
+
+/// What a pupil from the extended search must be like to be taken (the live engine fills it in from what it knows of
+/// the open eye; see live::EXT_MAX_PX). A pupil it refuses is not found: the lids and the box are measured where the
+/// last pupil was, as on any frame without one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ExtCheck {
+    /// The smallest share of its rays that reach its edge, and the smallest b/a.
+    pub min_vis: f64,
+    pub min_ba: f64,
+    /// Its semi-axis, px, and the darkest its inside may be (`Pupil::inner`).
+    pub a: (f64, f64),
+    pub inner_max: f64,
+    /// Within this many px (third) of this point (the last pupil while its track is fresh), if given.
+    pub near: Option<(f64, f64, f64)>,
+    /// Valve's openness says the eye is closing: the extended search does not run.
+    pub closing: bool,
+}
+
+impl ExtCheck {
+    /// Any pupil the search finds.
+    pub const ANY: ExtCheck = ExtCheck {
+        min_vis: 0.0,
+        min_ba: 0.0,
+        a: (0.0, f64::INFINITY),
+        inner_max: f64::INFINITY,
+        near: None,
+        closing: false,
+    };
+
+    pub fn accepts(&self, p: &Pupil) -> bool {
+        p.vis >= self.min_vis
+            && p.b / p.a >= self.min_ba
+            && (self.a.0..=self.a.1).contains(&p.a)
+            && p.inner <= self.inner_max
+            && self.near.is_none_or(|(x, y, d)| (p.cx - x).hypot(p.cy - y) <= d)
+    }
+}
+
+/// How the pupil is searched for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Search {
+    /// Left edge of the search window, and of the lid and box regions (they never reach left of it).
+    pub x_min: f64,
+    /// Left edge of the extended search (at most `x_min`): when the search inside `x_min` finds no pupil, the blobs
+    /// are looked for once more from here, and only a pupil reaching into the edge zone is taken (EXT_EDGE_PX). The
+    /// lids, the iris box and everything else stay at `x_min`. Equal to `x_min`: no extended search.
+    pub find_x_min: f64,
+    /// What a pupil from the extended search must be like.
+    pub ext: ExtCheck,
+    /// The prototype's rules (`--compat`): left edge fixed at X_MIN, blobs touching it dropped, only the best blob
+    /// refined, no second try without the prior.
+    pub legacy: bool,
+    /// The dim-side search, for a wear whose pupil sits in the dim part of the picture (`DimSearch`); None: none.
+    pub dim: Option<DimSearch>,
+}
+
+/// The last search when nothing else found a pupil, for a wear where the part of the picture around the temporal edge
+/// is much dimmer than the eye as a whole (`Levels::dim_side`): the blobs are looked for once more from `x0`, with the
+/// grey steps (the blob thresholds and the step the pupil's rays need) scaled to how bright that part is; a pupil it
+/// finds must have its small-x edge left of `x_min` and pass `check`. Issue 52's pupils from it had that edge at x
+/// 156 / 175 (left / right, medians; 99% left of 181 / 194, with x_min 180 / 186). Allowed up to x_min + 20, it also
+/// took pupils with that edge at 195..198 on the developer's 2026-10-09 18:16 user calibration, 0.6 x the size the
+/// usual passes found for the same pupil on the frames around them.
+/// Issue 52 (prescription inserts at a low IPD, 2026-11-07): the eye sat at the small-x edge of the lit picture, the
+/// pupil at x 160..215 where the column means are 25..50 against 165..195 over the sclera. The iris on the pupil's
+/// temporal side read 18..22 against the pupil's 9..12, under the first blob threshold (the window's dark level + 14):
+/// the pupil merged with the shaded iris and the shading into one blob that touched the window's top and bottom, or, cut
+/// by the window, none of its rays pointing left found an edge (EDGE_LEFT_SHARE). The pupil was found in 8% / 6% (left /
+/// right) of the open steps' frames, the warm-up never finished in 84 s, and a closed eye did not read closed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DimSearch {
+    /// The left edge of its window (the right edge is the lens edge).
+    pub x0: f64,
+    /// The levels of the dim part of the picture.
+    pub levels: Levels,
+    /// What a pupil it finds must be like.
+    pub check: ExtCheck,
+}
+
+impl Search {
+    pub const LEGACY: Search = Search { x_min: X_MIN, find_x_min: X_MIN, ext: ExtCheck::ANY, legacy: true, dim: None };
+
+    /// The live rules with this left edge.
+    pub fn live(x_min: f64) -> Search {
+        Search::live_ext(x_min, x_min, ExtCheck::ANY)
+    }
+
+    /// The live rules with this left edge and the extended search from `find_x_min` (within [X_MIN_LO, x_min]).
+    pub fn live_ext(x_min: f64, find_x_min: f64, ext: ExtCheck) -> Search {
+        let x_min = x_min.clamp(X_MIN_LO, X_MIN);
+        let find_x_min = if find_x_min.is_finite() { find_x_min.clamp(X_MIN_LO, x_min) } else { x_min };
+        Search { x_min, find_x_min, ext, legacy: false, dim: None }
+    }
+}
+
+/// Why blobs were dropped, as bits of `Diag::rejected`.
+pub const REJ_LEFT: u8 = 1;
+pub const REJ_TOP: u8 = 2;
+pub const REJ_BOTTOM: u8 = 4;
+pub const REJ_BIG: u8 = 8;
+pub const REJ_SHAPE: u8 = 16;
+
+/// What the pupil search saw in one frame (for the calibration report).
+#[derive(Clone, Copy, Debug)]
+pub struct Diag {
+    /// The search window's dark level (0.5th percentile) and median, in the opened, blurred image.
+    pub lo: f64,
+    pub p50: f64,
+    /// The left edge used.
+    pub x_min: f64,
+    /// Blobs that passed the size and shape tests (the most of the two searches when it searched again).
+    pub candidates: u8,
+    /// REJ_* bits for blobs of at least 120 px that were dropped.
+    pub rejected: u8,
+    /// No candidate near the prior refined, and the search ran again without it.
+    pub retried: bool,
+    /// The pupil came from a blob that touches the window's left edge.
+    pub left_edge: bool,
+    /// The engine dropped the pupil: found while the iris box was as bright as lid skin and unlike the open pupil.
+    pub gated: bool,
+    /// The engine forgot its search prior on this frame (too many frames without a pupil).
+    pub prior_reset: bool,
+    /// A blob cut by the window's left edge refined into an ellipse but was refused for its missing left edge
+    /// (shading, or a pupil the window cuts).
+    pub left_refused: bool,
+    /// The search inside `x_min` found nothing and the extended one ran (`Search::find_x_min`) ...
+    pub ext_tried: bool,
+    /// ... and the pupil came from it ...
+    pub extended: bool,
+    /// ... or it found one `Search::ext` refused (not like the open pupil, or off its track).
+    pub ext_refused: bool,
+    /// The pupil came from the dim-side search (`Search::dim`) ...
+    pub dim: bool,
+    /// ... or it found one its check refused.
+    pub dim_refused: bool,
+}
+
+impl Default for Diag {
+    fn default() -> Self {
+        Self {
+            lo: f64::NAN,
+            p50: f64::NAN,
+            x_min: f64::NAN,
+            candidates: 0,
+            rejected: 0,
+            retried: false,
+            left_edge: false,
+            gated: false,
+            prior_reset: false,
+            left_refused: false,
+            ext_tried: false,
+            extended: false,
+            ext_refused: false,
+            dim: false,
+            dim_refused: false,
+        }
+    }
+}
+
+/// A dark blob that may be the pupil: score, centre, radius estimate, touches the window's left edge.
+#[derive(Clone, Copy, Debug)]
+struct Cand {
+    score: f64,
+    c: (f64, f64),
+    r: f64,
+    left: bool,
+}
+
+/// A found pupil: ellipse centre, semi-axes (a >= b), the fitted ellipse, the dark level, visible ray share.
+#[derive(Clone, Copy, Debug)]
+pub struct Pupil {
+    pub cx: f64,
+    pub cy: f64,
+    pub a: f64,
+    pub b: f64,
+    pub ell: Ellipse,
+    pub inner: f64,
+    pub vis: f64,
+}
+
+/// One lid line: quadratic over the iris columns, its height at the pupil column, inlier share, edge strength, and
+/// the share of its inliers on the search band's first or last rows (LID_EDGE_SHARE), and on its last rows only.
+#[derive(Clone, Copy, Debug)]
+struct Lid {
+    coef: Quad,
+    /// The first and last of the columns it was fitted over.
+    cols: (f64, f64),
+    y_at: f64,
+    frac: f64,
+    grad: f64,
+    edge: f64,
+    edge_far: f64,
+}
+
+impl Lid {
+    /// Pushed against its band's edge: no line (LID_EDGE_SHARE).
+    fn on_edge(&self) -> bool {
+        self.edge >= LID_EDGE_SHARE
+    }
+
+    /// Pushed against its band's far (last) rows: no lower line.
+    fn on_far_edge(&self) -> bool {
+        self.edge_far >= LID_EDGE_SHARE
+    }
+
+    /// Its shape, for the eye preview.
+    fn curve(&self) -> LidCurve {
+        LidCurve { coef: self.coef, x0: self.cols.0, x1: self.cols.1 }
+    }
+}
+
+/// A lid line's shape over the columns it was fitted on (px), only for the panel's eye preview (preview.rs): nothing
+/// measured is taken from it.
+#[derive(Clone, Copy, Debug)]
+pub struct LidCurve {
+    pub coef: Quad,
+    pub x0: f64,
+    pub x1: f64,
+}
+
+/// The per-frame features (NaN = not measured), named as in the prototype's CSV.
+#[derive(Clone, Copy, Debug)]
+pub struct Features {
+    pub ok_pupil: bool,
+    pub pupil_cx: f64,
+    pub pupil_cy: f64,
+    pub pupil_a: f64,
+    pub pupil_b: f64,
+    pub pupil_vis: f64,
+    pub iris_r: f64,
+    pub iris_n: u32,
+    pub upper_skin_y: f64,
+    pub upper_y: f64,
+    pub lower_y: f64,
+    pub upper_frac: f64,
+    pub lower_frac: f64,
+    pub box_mean: f64,
+    /// The pupil was seen, and the upper lid line found was pushed against its band's edge (LID_EDGE_SHARE) or lay below
+    /// the centre of a pupil seen whole (UPPER_WHOLE_VIS): left out, the upper lid has no line on this frame.
+    pub upper_edge: bool,
+    /// The lower lid line found was pushed against its band's far edge: left out, no lower line on this frame (live also
+    /// sets it when it replaces a line found far below the last one, live::LOWER_DROP_MAX).
+    pub lower_edge: bool,
+    /// The shapes of the upper lid's skin line and the lower lid's line, set with `upper_skin_y` / `lower_y` (for the
+    /// eye preview only).
+    pub upper_curve: Option<LidCurve>,
+    pub lower_curve: Option<LidCurve>,
+    /// How the search went (not part of the prototype's features).
+    pub diag: Diag,
+}
+
+impl Default for Features {
+    fn default() -> Self {
+        let n = f64::NAN;
+        Self {
+            diag: Diag::default(),
+            ok_pupil: false,
+            pupil_cx: n,
+            pupil_cy: n,
+            pupil_a: n,
+            pupil_b: n,
+            pupil_vis: n,
+            iris_r: n,
+            iris_n: 0,
+            upper_skin_y: n,
+            upper_y: n,
+            lower_y: n,
+            upper_frac: n,
+            lower_frac: n,
+            box_mean: n,
+            upper_edge: false,
+            lower_edge: false,
+            upper_curve: None,
+            lower_curve: None,
+        }
+    }
+}
+
+/// The darkest column mean (the lens's black vignette and band) of the pictures the fixed grey levels and steps of this
+/// file were set on, and their span up to the brightest column mean over x 200..330 (sclera and skin around the iris):
+/// the developer's recordings, 3.9..4.4 and 148..179 over a wear's first 20 s, median 166.
+const LEVELS_DARK: f64 = 4.0;
+const LEVELS_SPAN_TYPICAL: f64 = 166.0;
+/// A span of LEVELS_SPAN_FULL or more is full contrast: the levels stay as built (the live profile from its first frame
+/// on gave 139.7..176 in 25 of the 26 recordings; the 26th starts with 5 s of darker frames). At LEVELS_SPAN_DIM or
+/// less the picture has that much less contrast than the typical one; in between the factor goes over to 1.
+const LEVELS_SPAN_FULL: f64 = 136.0;
+const LEVELS_SPAN_DIM: f64 = 116.0;
+/// A darkest column mean above this is a lifted black (haze, a lens insert's own glare): the levels move up with it.
+const LEVELS_DARK_LIFT: f64 = 12.0;
+/// The smallest contrast factor (a picture with almost nothing in it does not drive the steps to zero).
+const LEVELS_K_MIN: f64 = 0.2;
+/// The dim-side search (`DimSearch`) runs for a wear whose column means from the extended search's furthest edge to
+/// DIM_SIDE_PX right of `x_min` give under DIM_SIDE_SHARE of the picture's contrast factor (`Levels::dim_side`): issue
+/// 52's recording 0.27 / 0.20 (left / right, the picture's factor 1). The developer's recordings give 0.26..0.28 too
+/// (the temporal shading ends at about the same column; there the pupil sits further in, where the picture is lit), so
+/// the search runs for them as well, but only on frames where nothing else found a pupil, and only takes a pupil that
+/// reaches left of `x_min` (`DimSearch`). A picture lit evenly up to its temporal edge has no dim side.
+pub const DIM_SIDE_PX: f64 = 20.0;
+const DIM_SIDE_SHARE: f64 = 0.6;
+
+/// How the camera sees this wear against the pictures the fixed levels were set on, from the same column means as
+/// `occluder_x`: the darkest column and the brightest around the iris. A dimmer picture (a prescription lens insert
+/// that blocks some of the IR, a camera that sees less light) scales every grey step with it, and one with a lifted
+/// black (haze) moves every grey level up as well; at full brightness and contrast nothing moves. In replays of the
+/// 26 recordings made darker, the steps that did not move with the picture were what failed: first the pupil's
+/// threshold steps above the window's dark level (14 / 22 / 32), then the step the pupil's rays need (14). At 0.7 x
+/// the brightness the pupil was found on 79% of the open frames instead of 89% and the squint read 0.70 instead of
+/// 0.88; at 0.5 x 55% and 0.43. With every level moved by the factor the picture was made darker by, the replays
+/// came back to full brightness's.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Levels {
+    /// Contrast factor (1 = as built).
+    pub k: f64,
+    /// The darkest column mean, where the grey levels start from when they move.
+    pub dark: f64,
+    /// The levels move (the factor is below 1, or the black is lifted).
+    pub moved: bool,
+}
+
+impl Levels {
+    pub const AS_BUILT: Levels = Levels { k: 1.0, dark: LEVELS_DARK, moved: false };
+
+    /// From column means over rows 60..340 (`column_means`, one frame's or a mean).
+    pub fn from_profile(col_mean: &[f64]) -> Levels {
+        Self::from_profile_without(col_mean, &[])
+    }
+
+    /// The levels for a wear's column means as the live engine, the lens edge and the search window use them: with a
+    /// glare band that ends the picture (`glare_end`), its columns are left out of the bright end.
+    pub fn for_profile(col_mean: &[f64]) -> Levels {
+        if glare_end(col_mean).is_some() {
+            Self::from_profile_without(col_mean, &glare_columns(col_mean))
+        } else {
+            Self::from_profile(col_mean)
+        }
+    }
+
+    /// `from_profile` with the bright end taken outside the columns `skip` marks (a glare band beyond the iris is no
+    /// measure of how bright the eye is; `glare_columns`).
+    pub fn from_profile_without(col_mean: &[f64], skip: &[bool]) -> Levels {
+        let dark = col_mean.iter().copied().fold(f64::INFINITY, f64::min);
+        let eye = (200..330).filter(|&x| !skip.get(x).copied().unwrap_or(false)).map(|x| col_mean[x]);
+        let eye = eye.fold(f64::NEG_INFINITY, f64::max);
+        let all = || col_mean[200..330].iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let bright = if eye.is_finite() { eye } else { all() };
+        let span = bright - dark;
+        let k = if span >= LEVELS_SPAN_FULL {
+            1.0
+        } else {
+            let dim = span / LEVELS_SPAN_TYPICAL;
+            let t = ((span - LEVELS_SPAN_DIM) / (LEVELS_SPAN_FULL - LEVELS_SPAN_DIM)).max(0.0);
+            (dim + t * (1.0 - dim)).clamp(LEVELS_K_MIN, 1.0)
+        };
+        if k < 1.0 || dark > LEVELS_DARK_LIFT { Levels { k, dark, moved: true } } else { Levels::AS_BUILT }
+    }
+
+    /// The levels of the part of the picture from column `x0` to `x1` (`col_mean` as for `from_profile`): the darkest
+    /// column mean of the whole picture, and the brightest in that part as its bright end. Some only where that part's
+    /// contrast factor is under DIM_SIDE_SHARE of this one's (`DimSearch`).
+    pub fn dim_side(&self, col_mean: &[f64], x0: f64, x1: f64) -> Option<Levels> {
+        let n = col_mean.len();
+        let (x0, x1) = ((x0.max(0.0) as usize).min(n), (x1.max(0.0) as usize).min(n));
+        if x1 <= x0 {
+            return None;
+        }
+        let dark = col_mean.iter().copied().fold(f64::INFINITY, f64::min);
+        let bright = col_mean[x0..x1].iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let k = ((bright - dark) / LEVELS_SPAN_TYPICAL).clamp(LEVELS_K_MIN, 1.0);
+        (k < DIM_SIDE_SHARE * self.k).then_some(Levels { k, dark, moved: true })
+    }
+
+    /// A grey level set on the developer's pictures, in this picture.
+    pub fn level(&self, v: f64) -> f64 {
+        if self.moved { self.dark + self.k * (v - LEVELS_DARK) } else { v }
+    }
+
+    /// A grey step (a difference of levels) set on the developer's pictures, in this picture.
+    pub fn step(&self, d: f64) -> f64 {
+        if self.moved { self.k * d } else { d }
+    }
+
+    /// A grey level of this picture as it would be at full brightness and contrast (the inverse of `level`; ratios of
+    /// levels, such as the iris box against the open eye's, are taken on these).
+    pub fn unlevel(&self, v: f64) -> f64 {
+        if self.moved { (v - self.dark) / self.k + LEVELS_DARK } else { v }
+    }
+}
+
+impl Default for Levels {
+    fn default() -> Self {
+        Levels::AS_BUILT
+    }
+}
+
+/// A column mean at or above GLARE_LEVEL is a saturated glare band (IR reflected off a prescription lens insert's rim
+/// covers one side of the picture; the developer's recordings have no column mean above 180), and the GLARE_WIDEN
+/// columns next to it are its soft edge.
+const GLARE_LEVEL: f64 = 240.0;
+const GLARE_WIDEN: usize = 8;
+
+/// The columns a glare band covers (`GLARE_LEVEL`), widened by GLARE_WIDEN; all false without one.
+pub fn glare_columns(col_mean: &[f64]) -> Vec<bool> {
+    let n = col_mean.len();
+    let mut g = vec![false; n];
+    for x in (0..n).filter(|&x| col_mean[x] >= GLARE_LEVEL) {
+        g[x.saturating_sub(GLARE_WIDEN)..(x + GLARE_WIDEN + 1).min(n)].fill(true);
+    }
+    g
+}
+
+/// The lens-edge column: where the black band on the nasal (large-x) side starts (feat2.occluder_x), from column
+/// means over rows 60..340 of a frame or of a mean image. The band is darker than 25 at full brightness (`Levels`).
+/// A glare band on the nasal side hides the lens's black band, and the edge is then found past the glare
+/// (`glare_edge` is where the picture really ends).
+pub fn occluder_x(col_mean: &[f64]) -> f64 {
+    let lv = Levels::for_profile(col_mean).level(25.0);
+    let first = col_mean[280..].iter().position(|&m| m < lv).unwrap_or(120);
+    (280 + first) as f64 - 3.0
+}
+
+/// Where a glare band on the nasal side starts, as a lens edge (its first column from x 200 on, widened, less 3), or
+/// None without one.
+pub fn glare_edge(col_mean: &[f64]) -> Option<f64> {
+    glare_columns(col_mean)[200..].iter().position(|&g| g).map(|g| (200 + g) as f64 - 3.0)
+}
+
+/// A glare band ends the picture only when its edge is at or past this column: beyond where the iris's nasal edge
+/// usually is (open pupils at x 200..258 in the developer's recordings, iris radius about 57 px). A band further in
+/// lies over the iris, and the pupil search needs the room up to the lens edge.
+pub const GLARE_MIN_X: f64 = 280.0;
+
+/// The glare band's edge where it ends the picture (`glare_edge` at GLARE_MIN_X or further out), else None.
+pub fn glare_end(col_mean: &[f64]) -> Option<f64> {
+    glare_edge(col_mean).filter(|&g| g >= GLARE_MIN_X)
+}
+
+/// Column mean that counts as out of the dark temporal shading (`search_x_min`), at full brightness (`Levels`).
+const SHADE_END_LEVEL: f64 = 40.0;
+/// How far into the shading the live search may start, px.
+const SHADE_MARGIN: f64 = 10.0;
+
+/// The live search's left edge for this wear, from the same column means as `occluder_x`: where the dark shading
+/// on the temporal side ends, minus `SHADE_MARGIN`, within [X_MIN_LO, X_MIN]. The end is that of the bright region the
+/// iris is in: from X_MIN + SHADE_MARGIN (it and the next 3 columns at `SHADE_END_LEVEL` or brighter, else the
+/// shading reaches past it and the edge stays at X_MIN) leftwards to the last column at that level, x = 60 at the
+/// most. Something bright further out (lit skin beyond the shading) with shading between it and the iris does not
+/// pull the window over the shading. The shading follows the face: when the eyes sit further toward small x in the
+/// image, so does it, and the window follows. The prototype's X_MIN is the upper bound (the developer's recordings
+/// all give it).
+pub fn search_x_min(col_mean: &[f64]) -> f64 {
+    search_x_min_from(col_mean).0
+}
+
+/// Where `search_x_min`'s value came from (the drift log's `x_min_src`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum XMinFrom {
+    /// The shading reaches X_MIN + SHADE_MARGIN: the prototype's X_MIN.
+    Fixed,
+    /// The end of the shading, minus SHADE_MARGIN.
+    Shade,
+    /// The end of the shading was further out than X_MIN_LO allows: X_MIN_LO.
+    Floor,
+}
+
+impl XMinFrom {
+    pub fn name(self) -> &'static str {
+        match self {
+            XMinFrom::Fixed => "fixed",
+            XMinFrom::Shade => "shade",
+            XMinFrom::Floor => "floor",
+        }
+    }
+}
+
+/// `search_x_min` and where its value came from.
+pub fn search_x_min_from(col_mean: &[f64]) -> (f64, XMinFrom) {
+    let lv = Levels::for_profile(col_mean).level(SHADE_END_LEVEL);
+    // A glare band on the temporal side is not the bright region the iris is in.
+    let glare = glare_columns(col_mean);
+    let bright = |x: usize| col_mean[x] >= lv && !glare[x];
+    let top = (X_MIN + SHADE_MARGIN) as usize;
+    if !(top..top + 4).all(bright) {
+        return (X_MIN, XMinFrom::Fixed);
+    }
+    let mut end = top;
+    while end > 60 && bright(end - 1) {
+        end -= 1;
+    }
+    let x = end as f64 - SHADE_MARGIN;
+    if x < X_MIN_LO { (X_MIN_LO, XMinFrom::Floor) } else { (x.min(X_MIN), XMinFrom::Shade) }
+}
+
+/// Column means over rows 60..340 of one 400x400 image.
+pub fn column_means(img: &[u8]) -> Vec<f64> {
+    let mut m = vec![0.0; W];
+    for y in 60..340 {
+        for (x, v) in m.iter_mut().enumerate() {
+            *v += img[y * W + x] as f64;
+        }
+    }
+    m.iter_mut().for_each(|v| *v /= 280.0);
+    m
+}
+
+/// Python's int() on a float: truncation toward zero.
+fn pint(v: f64) -> isize {
+    v.trunc() as isize
+}
+
+/// Reusable buffers and kernels; one per eye (or per thread).
+pub struct Extractor {
+    op: Vec<u8>,
+    opf: Vec<u8>,
+    smf: Vec<u8>,
+    gy: Vec<i16>,
+    morph: MorphBufs,
+    gauss: GaussBufs,
+    k1: Vec<u32>,
+    k15: Vec<u32>,
+    cc: CcBufs,
+    comps: Vec<Component>,
+    mask: Vec<bool>,
+    cands: Vec<Cand>,
+    /// The search rules (default: the prototype's).
+    pub search: Search,
+    /// First column of `opf` computed for the current frame (left of it: zeros, or an earlier frame's pixels).
+    opf_x0: usize,
+    /// The iris radius the current frame's lids were searched with (`upper_high` uses the same).
+    lid_r: f64,
+    /// The grey steps' scale for this wear (live sets it from the column means; as built by default).
+    pub levels: Levels,
+    /// The iris radius takes the first rise out of the iris toward large x, not the strongest (IRIS_FIRST_SHARE; live
+    /// sets it for a wear whose radius is implausible for its pupil).
+    pub iris_first: bool,
+}
+
+impl Default for Extractor {
+    fn default() -> Self {
+        Self {
+            cands: Vec::new(),
+            search: Search::LEGACY,
+            opf_x0: OPF_X0,
+            lid_r: f64::NAN,
+            iris_first: false,
+            levels: Levels::AS_BUILT,
+            op: Vec::new(),
+            opf: Vec::new(),
+            smf: Vec::new(),
+            gy: vec![0; W * H],
+            morph: MorphBufs::default(),
+            gauss: GaussBufs::default(),
+            k1: vision::gauss_kernel_fixed(1.0),
+            k15: vision::gauss_kernel_fixed(1.5),
+            cc: CcBufs::default(),
+            comps: Vec::new(),
+            mask: Vec::new(),
+        }
+    }
+}
+
+impl Extractor {
+    /// feat2.extract. `img`: upright 400x400. `prev`: last pupil centre (search prior). `r_ref`: iris radius for the
+    /// search windows (else this frame's own). `prev_p`: last good pupil, used to still measure lids and the box when
+    /// no pupil is found (closed, or lashes over it). Returns the features and the pupil if found.
+    pub fn extract(
+        &mut self,
+        img: &[u8],
+        xmax: f64,
+        prev: Option<(f64, f64)>,
+        r_ref: Option<f64>,
+        prev_p: Option<&Pupil>,
+    ) -> (Features, Option<Pupil>) {
+        let mut f = Features::default();
+        let search = self.search;
+        let ext = !search.legacy && search.find_x_min < search.x_min;
+        // The first pass's rays stop at the columns it always had (`refine_pupil`), also when the opening is worked
+        // out further left for the extended search: the columns from x_min - OPEN_BEFORE + 8 on are the same either
+        // way, so the search inside x_min, the lids and the box come out as without the extended search.
+        let dim = search.dim.filter(|_| !search.legacy);
+        let (open_x0, opf_x0, first_opf_x0) = if search.legacy {
+            (OPEN_X0, OPF_X0, OPF_X0)
+        } else {
+            let x0 = (search.x_min as usize).saturating_sub(OPEN_BEFORE);
+            let x0_ext = (search.find_x_min as usize).saturating_sub(OPEN_BEFORE);
+            (x0_ext, x0_ext + 8, x0 + 8)
+        };
+        // The dim-side search's window may start left of the extended one's: the opening reaches it too (the columns
+        // the other passes use come out the same).
+        let dim_open_x0 = dim.map_or(open_x0, |d| open_x0.min((d.x0.max(0.0) as usize).saturating_sub(OPEN_BEFORE)));
+        vision::open9_cols(img, W, H, dim_open_x0, W, &mut self.morph, &mut self.op);
+        let gauss_x0 = opf_x0.min(dim_open_x0 + 8);
+        vision::gauss_u8(&self.op, W, H, &self.k1, Rect { x0: gauss_x0, y0: 0, x1: W, y1: H }, &mut self.gauss, &mut self.opf);
+        self.opf_x0 = first_opf_x0;
+        f.diag.x_min = search.x_min;
+        let p = if search.legacy {
+            self.find_pupil_blob(search.x_min, xmax, prev, &mut f.diag);
+            let blob = self.cands.first().copied();
+            blob.and_then(|b| self.refine_pupil(b.c, b.r, xmax)).map(|x| x.0)
+        } else {
+            self.find_pupil_blob(search.x_min, xmax, prev, &mut f.diag);
+            let mut p = self.refine_candidates(xmax, None, None, &mut f.diag);
+            if p.is_none()
+                && let Some(pv) = prev
+            {
+                // The prior may be on something that is not the pupil: once more without it, for a pupil somewhere
+                // else (near the prior this would only find the same blob at another threshold: lids half over the
+                // pupil, as in a squint, which the prototype does not count as a pupil either).
+                f.diag.retried = true;
+                self.find_pupil_blob(search.x_min, xmax, None, &mut f.diag);
+                p = self.refine_candidates(xmax, Some(pv), None, &mut f.diag);
+            }
+            if p.is_none() && ext && !search.ext.closing {
+                // Nothing inside x_min: once more from the extended edge, for a pupil the window's edge cuts (its
+                // blob merged with the shading at the edge, or too little of it inside). What this pass saw stays
+                // out of the diagnosis (the calibration report describes the search inside x_min).
+                self.opf_x0 = opf_x0;
+                f.diag.ext_tried = true;
+                // Only as far right as such a pupil reaches (its small-x edge left of x_min + EXT_EDGE_PX, its
+                // semi-axis at most the check's): the blobs further in were the first pass's to take or leave.
+                let x_hi = (search.x_min + EXT_EDGE_PX + 2.0 * search.ext.a.1.min(EXT_MAX_A) + 4.0).min(xmax);
+                let mut d = Diag::default();
+                self.find_pupil_blob(search.find_x_min, x_hi, prev, &mut d);
+                p = self.refine_candidates(xmax, None, Some((search.x_min + EXT_EDGE_PX, search.ext)), &mut d);
+                f.diag.extended = p.is_some();
+                f.diag.ext_refused = d.ext_refused;
+            }
+            if p.is_none()
+                && !search.ext.closing
+                && let Some(d) = dim
+            {
+                // Nothing anywhere: once more on the dim side, with the grey steps of that part of the picture (what
+                // this pass saw stays out of the diagnosis too).
+                // Only a pupil whose small-x edge is left of x_min is taken, and the blobs are looked for only as far
+                // right as such a pupil reaches: further in, the usual passes' levels are the ones that hold.
+                self.opf_x0 = dim_open_x0 + 8;
+                let levels = std::mem::replace(&mut self.levels, d.levels);
+                let edge = search.x_min;
+                let x_hi = (edge + 2.0 * d.check.a.1.min(EXT_MAX_A) + 4.0).min(xmax);
+                let mut dd = Diag::default();
+                self.find_pupil_blob(d.x0, x_hi, prev, &mut dd);
+                p = self.refine_candidates(xmax, None, Some((edge, d.check)), &mut dd);
+                self.levels = levels;
+                f.diag.dim = p.is_some();
+                f.diag.dim_refused = dd.ext_refused;
+            }
+            p
+        };
+        f.ok_pupil = p.is_some();
+        let r_ref = r_ref.filter(|&r| r != 0.0);
+        let Some(p) = p else {
+            let Some(q) = prev_p else { return (f, None) };
+            let rn = r_ref.unwrap_or(2.0 * q.a);
+            f.box_mean = self.box_mean(q.cx, q.cy, rn, xmax);
+            let (upper, lower, margin) = self.lids(q, rn, xmax, false);
+            if let Some(u) = upper {
+                f.upper_skin_y = u.y_at;
+                f.upper_y = u.y_at + margin.unwrap_or(MARGIN_OFF);
+                f.upper_frac = u.frac;
+                f.upper_curve = Some(u.curve());
+            }
+            f.lower_edge = lower.is_some_and(|l| l.on_far_edge());
+            if let Some(l) = lower.filter(|l| !l.on_far_edge()) {
+                f.lower_y = l.y_at;
+                f.lower_frac = l.frac;
+                f.lower_curve = Some(l.curve());
+            }
+            return (f, None);
+        };
+        f.pupil_cx = p.cx;
+        f.pupil_cy = p.cy;
+        f.pupil_a = p.a;
+        f.pupil_b = p.b;
+        f.pupil_vis = p.vis;
+        let (r, n) = self.iris_fit(&p, xmax);
+        f.iris_r = r;
+        f.iris_n = n;
+        let rn = r_ref.unwrap_or(if r.is_finite() { r } else { 2.0 * p.a });
+        let (upper, lower, margin) = self.lids(&p, rn, xmax, p.vis >= UPPER_WHOLE_VIS);
+        let no_line = |u: &Lid| u.on_edge() || (p.vis >= UPPER_WHOLE_VIS && u.y_at > p.cy);
+        f.upper_edge = upper.is_some_and(|u| no_line(&u));
+        if let Some(u) = upper.filter(|u| !no_line(u)) {
+            f.upper_skin_y = u.y_at;
+            f.upper_y = u.y_at + margin.unwrap_or(MARGIN_OFF);
+            f.upper_frac = u.frac;
+            f.upper_curve = Some(u.curve());
+        }
+        f.lower_edge = lower.is_some_and(|l| l.on_far_edge());
+        if let Some(l) = lower.filter(|l| !l.on_far_edge()) {
+            f.lower_y = l.y_at;
+            f.lower_frac = l.frac;
+            f.lower_curve = Some(l.curve());
+        }
+        f.box_mean = self.box_mean(p.cx, p.cy, rn, xmax);
+        (f, Some(p))
+    }
+
+    /// Dark compact blobs in the opened, blurred image from column `xs` to `xmax`, best first, into `self.cands`. The
+    /// prototype's rules keep only the best one and drop blobs that touch the window's left edge; the live ones keep up
+    /// to MAX_CANDIDATES and keep blobs cut by the left edge (`refine_candidates` decides).
+    fn find_pupil_blob(&mut self, xs: f64, xmax: f64, prev: Option<(f64, f64)>, diag: &mut Diag) {
+        let legacy = self.search.legacy;
+        let (x0, y0, x1, y1) = (xs as usize, SEARCH_Y0, (pint(xmax).clamp(xs as isize + 1, W as isize)) as usize, SEARCH_Y1);
+        let (sw, sh) = (x1 - x0, y1 - y0);
+        let opf = &self.opf;
+        let at = |x: usize, y: usize| opf[(y0 + y) * W + x0 + x];
+        let mut hist = [0u32; 256];
+        let window = |xa: usize, ya: usize, xb: usize, yb: usize, hist: &mut [u32; 256]| {
+            for y in ya..yb {
+                for x in xa..xb {
+                    hist[at(x, y) as usize] += 1;
+                }
+            }
+        };
+        match prev {
+            Some((px, py)) => {
+                let wx0 = pint(px - 70.0 - x0 as f64).max(0) as usize;
+                let wy0 = pint(py - 70.0 - y0 as f64).max(0) as usize;
+                let (wx1, wy1) = ((wx0 + 140).min(sw), (wy0 + 140).min(sh));
+                if wx0 < wx1 && wy0 < wy1 {
+                    window(wx0, wy0, wx1, wy1, &mut hist);
+                } else {
+                    window(0, 0, sw, sh, &mut hist);
+                }
+            }
+            None => window(0, 0, sw, sh, &mut hist),
+        }
+        let lo = vision::percentile_hist(&hist, 0.5);
+        diag.lo = lo;
+        diag.p50 = vision::percentile_hist(&hist, 50.0);
+        self.cands.clear();
+        let mut best: Option<Cand> = None;
+        for dth in [14.0, 22.0, 32.0] {
+            let th = lo + self.levels.step(dth);
+            self.mask.clear();
+            self.mask.extend((0..sh).flat_map(|y| (0..sw).map(move |x| (y, x))).map(|(y, x)| (at(x, y) as f64) < th));
+            vision::components(&self.mask, sw, sh, &mut self.cc, &mut self.comps);
+            for c in &self.comps {
+                let (w, h, a) = (c.w as f64, c.h as f64, c.area as f64);
+                if c.area < 120 {
+                    continue;
+                }
+                let rej = if c.area > 5500 { REJ_BIG } else { 0 }
+                    | if c.x == 0 && legacy { REJ_LEFT } else { 0 }
+                    | if c.y == 0 { REJ_TOP } else { 0 }
+                    | if c.y + c.h >= sh { REJ_BOTTOM } else { 0 };
+                let fill = a / (w * h);
+                let rej = rej | if w > 2.6 * h || h > 2.6 * w || fill < 0.5 { REJ_SHAPE } else { 0 };
+                if rej != 0 {
+                    diag.rejected |= rej;
+                    continue;
+                }
+                let left = c.x == 0;
+                let (centre, r) = if left {
+                    // Cut by the window: the height is still the pupil's diameter, and its centre is that radius
+                    // left of the blob's right end.
+                    let r = 0.5 * h;
+                    ((x0 as f64 + c.x as f64 + w - r, y0 as f64 + c.y as f64 + r), r.max((a / std::f64::consts::PI).sqrt()))
+                } else {
+                    ((c.cx + x0 as f64, c.cy + y0 as f64), (a / std::f64::consts::PI).sqrt())
+                };
+                let d = prev.map_or(0.0, |(px, py)| (centre.0 - px).hypot(centre.1 - py));
+                let sc = a * fill / (1.0 + (d - 20.0).max(0.0).powi(2) / 400.0);
+                let cand = Cand { score: sc, c: centre, r, left };
+                if best.is_none_or(|b| sc > b.score) {
+                    best = Some(cand);
+                }
+                if !legacy {
+                    self.cands.push(cand);
+                }
+            }
+            if best.is_some_and(|b| b.r > 9.0) {
+                break;
+            }
+        }
+        if legacy {
+            self.cands.extend(best);
+        } else {
+            // Best first; the same blob at a higher threshold level only once.
+            self.cands.sort_by(|a, b| b.score.total_cmp(&a.score));
+            let mut kept: Vec<Cand> = Vec::with_capacity(MAX_CANDIDATES);
+            for c in &self.cands {
+                if kept.len() < MAX_CANDIDATES && kept.iter().all(|k| (k.c.0 - c.c.0).hypot(k.c.1 - c.c.1) > 6.0) {
+                    kept.push(*c);
+                }
+            }
+            self.cands = kept;
+        }
+        diag.candidates = diag.candidates.max(self.cands.len() as u8);
+    }
+
+    /// Refine the candidates in order; the first that gives a pupil wins. A blob cut by the window's left edge also
+    /// needs the pupil's edge on the rays pointing left (outside the window), and no pupil may be centred past the
+    /// lens edge (an arc of dark lens band fitted as an ellipse). Blobs within RETRY_MIN_JUMP of `away_from` are
+    /// skipped. With `edge_zone` (the extended search), only a pupil whose small-x edge is left of its x counts, and
+    /// only if its check accepts it.
+    fn refine_candidates(
+        &mut self,
+        xmax: f64,
+        away_from: Option<(f64, f64)>,
+        edge_zone: Option<(f64, ExtCheck)>,
+        diag: &mut Diag,
+    ) -> Option<Pupil> {
+        for i in 0..self.cands.len() {
+            let c = self.cands[i];
+            if away_from.is_some_and(|(x, y)| (c.c.0 - x).hypot(c.c.1 - y) < RETRY_MIN_JUMP) {
+                continue;
+            }
+            let Some((p, left_share)) = self.refine_pupil(c.c, c.r, xmax) else { continue };
+            let left_ok = !c.left || left_share >= EDGE_LEFT_SHARE;
+            if !left_ok {
+                diag.left_refused = true;
+                continue;
+            }
+            let before_lens = p.cx < xmax;
+            if !before_lens {
+                continue;
+            }
+            match edge_zone {
+                Some((z, _)) if p.cx - p.a >= z => continue,
+                Some((_, check)) if !check.accepts(&p) => {
+                    diag.ext_refused = true;
+                    continue;
+                }
+                _ => {}
+            }
+            diag.left_edge = c.left;
+            return Some(p);
+        }
+        None
+    }
+
+    /// Rays from the blob centre; the sub-pixel crossing of the middle level between the pupil and the iris on
+    /// each, rejecting rays that end past the lens edge or stay dark outside (lashes, lid, vignette); ellipse fit.
+    /// Also returns the share of the rays pointing left (more than 60 degrees from vertical) that found the edge.
+    /// Rays that reach left of the columns computed for this frame (a tall blob cut by the window's left edge) are
+    /// skipped and not counted among the left ones: those columns hold nothing of this frame.
+    fn refine_pupil(&self, c: (f64, f64), r0: f64, xmax: f64) -> Option<(Pupil, f64)> {
+        let (cx, cy) = c;
+        let (start, stop) = (0.4 * r0, 2.0 * r0 + 6.0);
+        let nr = ((stop - start) / 0.5).ceil().max(0.0) as usize;
+        let rs: Vec<f64> = (0..nr).map(|i| start + i as f64 * 0.5).collect();
+        if rs.len() < 4 {
+            return None;
+        }
+        let mut prof = vec![0f32; NRAY * nr];
+        let mut last_x = [0f64; NRAY];
+        for k in 0..NRAY {
+            let th = k as f64 * (std::f64::consts::TAU / NRAY as f64);
+            let (co, si) = (th.cos(), th.sin());
+            for (j, &r) in rs.iter().enumerate() {
+                let (x, y) = (cx + co * r, cy + si * r);
+                prof[k * nr + j] = vision::sample(&self.opf, W, H, x as f32, y as f32);
+            }
+            last_x[k] = cx + co * rs[nr - 1];
+        }
+        let mut inner_v: Vec<f64> = Vec::new();
+        for k in 0..NRAY {
+            for (j, &r) in rs.iter().enumerate() {
+                if r < 0.6 * r0 {
+                    inner_v.push(prof[k * nr + j] as f64);
+                }
+            }
+        }
+        let inner = vision::median(&mut inner_v);
+        let mut pts: Vec<(f64, f64)> = Vec::with_capacity(NRAY);
+        let mut ok = 0usize;
+        let (mut left_n, mut left_ok) = (0usize, 0usize);
+        let mut ov = Vec::with_capacity(nr);
+        let x_lo = self.opf_x0 as f64;
+        for k in 0..NRAY {
+            if last_x[k] < x_lo {
+                continue;
+            }
+            let left = (k as f64 * (std::f64::consts::TAU / NRAY as f64)).cos() < -0.5;
+            left_n += left as usize;
+            let row = &prof[k * nr..(k + 1) * nr];
+            ov.clear();
+            ov.extend(rs.iter().zip(row).filter(|(r, _)| **r > 1.25 * r0 && **r < 1.7 * r0).map(|(_, &v)| v as f64));
+            let outer = vision::median(&mut ov);
+            if outer - inner < self.levels.step(14.0) || outer.is_nan() || last_x[k] >= xmax {
+                continue;
+            }
+            let th = inner + 0.5 * (outer - inner);
+            let Some(j) = row.iter().position(|&v| v as f64 > th) else { continue };
+            if j == 0 {
+                continue;
+            }
+            let (p0, p1) = (row[j - 1] as f64, row[j] as f64);
+            let fr = (th - p0) / (p1 - p0).max(1e-3);
+            let r = rs[j - 1] + fr * (rs[j] - rs[j - 1]);
+            if r < 0.5 * r0 || r > 1.9 * r0 {
+                continue;
+            }
+            ok += 1;
+            left_ok += left as usize;
+            let ang = k as f64 * (std::f64::consts::TAU / NRAY as f64);
+            pts.push((cx + ang.cos() * r, cy + ang.sin() * r));
+        }
+        if pts.len() < 10 {
+            return None;
+        }
+        let e = fit_ellipse_robust(pts)?;
+        let (a, b) = (e.a.max(e.b) / 2.0, e.a.min(e.b) / 2.0);
+        if !(5.0 < b && a < 60.0 && b / a > 0.35) {
+            return None;
+        }
+        Some((Pupil { cx: e.cx, cy: e.cy, a, b, ell: e, inner, vis: ok as f64 / NRAY as f64 }, left_ok as f64 / left_n as f64))
+    }
+
+    /// Iris radius from limbus crossings on rays to the left and right (top and bottom excluded), mapped into the
+    /// pupil ellipse's frame; crossings on the right (large x: the nasal side of both upright images, dark iris ->
+    /// bright sclera) are preferred (feat2 calls them "nasal", its comments "temporal"). (R, inliers).
+    fn iris_fit(&self, p: &Pupil, xmax: f64) -> (f64, u32) {
+        let (cx, cy) = (p.cx, p.cy);
+        let t = p.ell.angle_deg.to_radians();
+        let ratio = p.ell.b.min(p.ell.a) / p.ell.a.max(p.ell.b);
+        // Our ellipse's `a` is the major axis along `angle_deg`.
+        let ua = (t.cos(), t.sin());
+        let ub = (-ua.1, ua.0);
+        let start = p.a * 1.25 + 3.0;
+        let nr = ((95.0 - start) / 0.75).ceil().max(0.0) as usize;
+        let rs: Vec<f64> = (0..nr).map(|i| start + i as f64 * 0.75).collect();
+        let mut res: Vec<(f64, bool)> = Vec::new();
+        let mut prof: Vec<f64> = Vec::with_capacity(nr);
+        let mut rok: Vec<f64> = Vec::with_capacity(nr);
+        let degs = (0..17).map(|i| -40 + 5 * i).chain((0..17).map(|i| 140 + 5 * i));
+        for deg in degs {
+            let th = (deg as f64).to_radians();
+            let d = (th.cos(), th.sin());
+            prof.clear();
+            rok.clear();
+            for &r in &rs {
+                let (x, y) = (cx + d.0 * r, cy + d.1 * r);
+                if x < xmax - 3.0 && x > 2.0 {
+                    prof.push(vision::sample(&self.opf, W, H, x as f32, y as f32) as f64);
+                    rok.push(r);
+                }
+            }
+            let n = prof.len();
+            if n < 12 {
+                continue;
+            }
+            // np.convolve(prof, ones(3)/3, 'same'): zero outside.
+            let sm: Vec<f64> = (0..n)
+                .map(|i| {
+                    let a = if i > 0 { prof[i - 1] } else { 0.0 };
+                    let c = if i + 1 < n { prof[i + 1] } else { 0.0 };
+                    (a + prof[i] + c) / 3.0
+                })
+                .collect();
+            let large_x = d.0 > 0.0;
+            let gg: Vec<f64> = (0..n - 3)
+                .map(|i| {
+                    let g = sm[i + 3] - sm[i];
+                    if large_x || g > 0.0 { g } else { -0.8 * g }
+                })
+                .collect();
+            let mut k = 2;
+            for i in 2..gg.len() - 2 {
+                if gg[i] > gg[k] {
+                    k = i;
+                }
+            }
+            let th = self.levels.step(if large_x { 12.0 } else { 9.0 });
+            if gg[k] < th {
+                continue;
+            }
+            // Toward large x the limbus is the first rise out of the iris: an earlier rise of its own (the gradient
+            // falls back below IRIS_VALLEY of it before the strongest) at least IRIS_FIRST_SHARE as strong is the
+            // limbus, and the strongest one an edge beyond the sclera (IRIS_FIRST_SHARE).
+            if self.iris_first
+                && large_x
+                && let Some(i) = (3..k).find(|&i| {
+                    gg[i] >= th
+                        && gg[i] >= IRIS_FIRST_SHARE * gg[k]
+                        && gg[i] >= gg[i - 1]
+                        && gg[i] >= gg[i + 1]
+                        && gg[i + 1..k].iter().any(|&g| g < IRIS_VALLEY * gg[i])
+                })
+            {
+                k = i;
+            }
+            let r = rok[k + 1] + 0.375;
+            let v = (d.0 * r, d.1 * r);
+            let (ra, rb) = (v.0 * ua.0 + v.1 * ua.1, v.0 * ub.0 + v.1 * ub.1);
+            res.push((ra.hypot(rb / ratio), large_x));
+        }
+        if res.len() < 4 {
+            return (f64::NAN, 0);
+        }
+        let large_x_n = res.iter().filter(|r| r.1).count();
+        let mut rho: Vec<f64> = res.iter().filter(|r| large_x_n < 4 || r.1).map(|r| r.0).collect();
+        let med = vision::median(&mut rho.clone());
+        rho.retain(|&r| (r - med).abs() < 6.0);
+        let n = rho.len() as u32;
+        let r = if n >= 3 { vision::median(&mut rho) } else { f64::NAN };
+        (r, n)
+    }
+
+    /// Vertical gradient of the opened image blurred with sigma 1.5, gy[y] = smf[y+2] - smf[y-2] (0 in the two rows
+    /// at each image edge), computed inside `rect` only.
+    fn grad_image(&mut self, rect: Rect) {
+        let sm = Rect { x0: rect.x0, y0: rect.y0.saturating_sub(2), x1: rect.x1, y1: (rect.y1 + 2).min(H) };
+        vision::gauss_u8(&self.op, W, H, &self.k15, sm, &mut self.gauss, &mut self.smf);
+        for y in rect.y0..rect.y1 {
+            for x in rect.x0..rect.x1 {
+                self.gy[y * W + x] =
+                    if (2..H - 2).contains(&y) { self.smf[(y + 2) * W + x] as i16 - self.smf[(y - 2) * W + x] as i16 } else { 0 };
+            }
+        }
+    }
+
+    /// Upper lid skin line (bright skin -> dark going down), its margin offset, and the lower lid (dark -> bright),
+    /// over the iris columns with the pupil masked (feat2.lids, base variant). `whole`: the pupil `p` is this frame's
+    /// and seen whole (ABOVE_PUPIL_PX).
+    fn lids(&mut self, p: &Pupil, r: f64, xmax: f64, whole: bool) -> (Option<Lid>, Option<Lid>, Option<f64>) {
+        self.lid_r = r;
+        let cy = p.cy;
+        let (xa, xb) = self.lid_cols(p, r, xmax);
+        if xb < xa + 20 {
+            return (None, None, None);
+        }
+        // Everything below reads gy over these columns, from the top of the upper search band to the bottom of the
+        // lower one (the margin search stays within those rows: it starts at the skin line, inside the upper band,
+        // and looks at most 17 rows further).
+        let top = pint((cy - 2.1 * r).max(4.0)).clamp(0, H as isize) as usize;
+        let bottom = (pint((cy + 1.9 * r).min(396.0)).max(pint((cy + 0.45 * r).min(396.0)) + 17)).clamp(0, H as isize) as usize;
+        if bottom > top {
+            self.grad_image(Rect { x0: xa, y0: top, x1: xb, y1: bottom });
+        }
+        let gy_ok = (top, bottom);
+        let mut out = [None, None];
+        for (which, slot) in out.iter_mut().enumerate() {
+            let (ya, yb) = if which == 0 {
+                (pint((cy - 2.1 * r).max(4.0)), pint((cy + 0.45 * r).min(396.0)))
+            } else {
+                (pint(cy + 0.25 * r), pint((cy + 1.9 * r).min(396.0)))
+            };
+            *slot = self.lid_line(p, (xa, xb), (ya, yb), gy_ok, which == 0);
+        }
+        let [mut upper, lower] = out;
+        if whole && let Some(low) = upper.filter(|u| !u.on_edge() && u.y_at > cy - ABOVE_PUPIL_B * p.b) {
+            let band = (pint((cy - 2.1 * r).max(4.0)), pint(cy - p.b - ABOVE_PUPIL_PX));
+            if let Some(u) = self.lid_line(p, (xa, xb), band, gy_ok, true).filter(|u| !u.on_edge() && u.frac >= low.frac) {
+                upper = Some(u);
+            }
+        }
+        let margin = upper.and_then(|u| self.margin(p, &u, xa, xb, gy_ok));
+        (upper, lower, margin)
+    }
+
+    /// The iris columns the lids are searched over.
+    fn lid_cols(&self, p: &Pupil, r: f64, xmax: f64) -> (usize, usize) {
+        let xa = pint((p.cx - 1.1 * r).max(self.search.x_min)).max(0) as usize;
+        let xb = pint((xmax - 3.0).min(p.cx + 1.45 * r)).clamp(0, W as isize) as usize;
+        (xa, xb)
+    }
+
+    /// One lid line in rows `ya..yb` over columns `xa..xb` (gy computed over rows `gy_ok`): the upper lid's (bright ->
+    /// dark going down) or the lower lid's (dark -> bright).
+    fn lid_line(&self, p: &Pupil, (xa, xb): (usize, usize), (ya, yb): (isize, isize), gy_ok: (usize, usize), upper: bool) -> Option<Lid> {
+        let (ya, yb) = (ya.clamp(0, H as isize) as usize, yb.clamp(0, H as isize) as usize);
+        if yb < ya + 6 {
+            return None;
+        }
+        let ny = yb - ya;
+        if ya < gy_ok.0 || yb > gy_ok.1 {
+            return None;
+        }
+        let xs: Vec<f64> = (xa..xb).map(|x| x as f64).collect();
+        let nx = xb - xa;
+        let inside = p.ell.inside_test(8.0);
+        let mut e = vec![0u8; ny * nx];
+        let mut hist = [0u32; 256];
+        for y in ya..yb {
+            for x in xa..xb {
+                let g = self.gy[y * W + x] as i32;
+                let v = if upper { -g } else { g }.clamp(0, 255) as u8;
+                let v = if inside(x as f64, y as f64) { 0 } else { v };
+                e[(y - ya) * nx + (x - xa)] = v;
+                hist[v as usize] += 1;
+            }
+        }
+        let nrm = vision::percentile_hist(&hist, 99.0) + 1e-3;
+        let path = dp_path(&e, ny, nx, nrm);
+        let ys: Vec<f64> = path.iter().map(|&y| (y + ya) as f64).collect();
+        let strength: Vec<f64> = path.iter().enumerate().map(|(j, &y)| e[y * nx + j] as f64).collect();
+        let good: Vec<bool> = strength.iter().map(|&s| s > 0.2 * nrm).collect();
+        let (coef, w) = robust_parabola(&xs, &ys, good)?;
+        let mut sw: Vec<f64> = strength.iter().zip(&w).filter(|(_, k)| **k).map(|(s, _)| *s).collect();
+        let n_in = w.iter().filter(|&&k| k).count();
+        let frac = n_in as f64 / w.len() as f64;
+        let grad = if sw.is_empty() { 0.0 } else { vision::median(&mut sw) };
+        let at_edge = path.iter().zip(&w).filter(|(y, k)| **k && (**y <= LID_EDGE_ROWS || **y + 1 + LID_EDGE_ROWS >= ny)).count();
+        let edge = at_edge as f64 / n_in.max(1) as f64;
+        let at_far = path.iter().zip(&w).filter(|(y, k)| **k && **y + 1 + LID_EDGE_ROWS >= ny).count();
+        let edge_far = at_far as f64 / n_in.max(1) as f64;
+        Some(Lid { coef, cols: (xa as f64, (xb - 1) as f64), y_at: coef.at(p.cx), frac, grad, edge, edge_far })
+    }
+
+    /// The calibration's second search for a widened upper lid, on the frame `extract` just ran on (its pupil `p`):
+    /// the upper lid line in the higher band HIGH_BAND, searched as the usual one is, at the radius the frame's lids
+    /// used. Returns its height at the pupil column (px) and its inlier share, or None (no line, or one pushed against
+    /// the band's edge). See live::widen_fit.
+    pub fn upper_high(&mut self, p: &Pupil, xmax: f64) -> Option<(f64, f64)> {
+        let r = self.lid_r;
+        if !r.is_finite() || r <= 0.0 {
+            return None;
+        }
+        let (xa, xb) = self.lid_cols(p, r, xmax);
+        if xb < xa + 20 {
+            return None;
+        }
+        let ya = pint((p.cy - HIGH_BAND.0 * r).max(4.0));
+        let yb = pint(p.cy - HIGH_BAND.1 * r);
+        let rows = (ya.clamp(0, H as isize) as usize, yb.clamp(0, H as isize) as usize);
+        if rows.1 < rows.0 + 6 {
+            return None;
+        }
+        self.grad_image(Rect { x0: xa, y0: rows.0, x1: xb, y1: rows.1 });
+        let u = self.lid_line(p, (xa, xb), (ya, yb), rows, true)?;
+        (!u.on_edge()).then_some((u.y_at, u.frac))
+    }
+
+    /// The thin dark band below the skin line has a nearly constant width: measure where the eyeball step below it
+    /// is clear (not over the pupil) and return the median offset (margin - skin line), if consistent.
+    fn margin(&self, p: &Pupil, u: &Lid, xa: usize, xb: usize, gy_rows: (usize, usize)) -> Option<f64> {
+        // OpenCV's RotatedRect from fitEllipse has width <= height: A = minor, B = major (full axes).
+        let (ex, ey, big_a, big_b) = (p.ell.cx, p.ell.cy, 2.0 * p.b, 2.0 * p.a);
+        let mut offs: Vec<f64> = Vec::new();
+        for x in xa..xb {
+            let ysk = u.coef.at(x as f64);
+            let y0 = ysk.round_ties_even() as isize + 3;
+            let y1 = (y0 + 14).min(395);
+            if y1 <= y0 + 2 || y0 < gy_rows.0 as isize || y1 > gy_rows.1 as isize {
+                continue;
+            }
+            if (x as f64 - ex).abs() < big_a / 2.0 + 4.0 && (y1 as f64) > ey - big_b / 2.0 - 3.0 {
+                continue;
+            }
+            let (y0, y1) = (y0 as usize, y1 as usize);
+            let mut k = y0;
+            for y in y0..y1 {
+                if self.gy[y * W + x] > self.gy[k * W + x] {
+                    k = y;
+                }
+            }
+            if self.gy[k * W + x] as f64 > (0.15 * u.grad).max(self.levels.step(5.0)) {
+                offs.push(k as f64 - ysk);
+            }
+        }
+        if offs.len() < 6 {
+            return None;
+        }
+        let o = vision::median(&mut offs.clone());
+        let mut inl: Vec<f64> = offs.into_iter().filter(|v| (v - o).abs() < 3.0).collect();
+        if inl.len() < 6 {
+            return None;
+        }
+        Some(vision::median(&mut inl))
+    }
+
+    /// Mean of the opened image in the box where the iris should be.
+    fn box_mean(&self, cx: f64, cy: f64, r: f64, xmax: f64) -> f64 {
+        let xa = pint((cx - 0.9 * r).max(self.search.x_min));
+        let xb = pint((xmax - 3.0).min(cx + 0.9 * r));
+        let ya = pint((cy - 0.45 * r).max(0.0));
+        let yb = pint((cy + 0.45 * r).min(400.0));
+        if xb - xa < 5 || yb - ya < 5 {
+            return f64::NAN;
+        }
+        let (xa, xb) = (xa.max(0) as usize, xb.min(W as isize) as usize);
+        let (ya, yb) = (ya.max(0) as usize, yb.min(H as isize) as usize);
+        let mut sum = 0u64;
+        for y in ya..yb {
+            sum += self.op[y * W + xa..y * W + xb].iter().map(|&v| v as u64).sum::<u64>();
+        }
+        sum as f64 / ((xb - xa) * (yb - ya)) as f64
+    }
+}
+
+/// fitEllipse with residual rejection (feat2.fit_ellipse_robust).
+fn fit_ellipse_robust(mut pts: Vec<(f64, f64)>) -> Option<Ellipse> {
+    if pts.len() < 6 {
+        return None;
+    }
+    let mut e = vision::fit_ellipse(&pts)?;
+    for _ in 0..2 {
+        let r: Vec<f64> = pts.iter().map(|&(x, y)| e.resid(x, y)).collect();
+        let mut ab: Vec<f64> = r.iter().map(|v| v.abs()).collect();
+        let s = (1.4826 * vision::median(&mut ab)).max(0.7);
+        let keep: Vec<bool> = r.iter().map(|v| v.abs() < 2.5 * s).collect();
+        let nk = keep.iter().filter(|&&k| k).count();
+        if nk < 6 || nk == keep.len() {
+            break;
+        }
+        pts = pts.into_iter().zip(&keep).filter(|(_, k)| **k).map(|(p, _)| p).collect();
+        e = vision::fit_ellipse(&pts)?;
+    }
+    Some(e)
+}
+
+/// Minimum-cost left-to-right path through cost = -min(e / nrm, 1), moving at most one row per column (each move
+/// costs 0.15); ties go to staying, then up, then down, like the prototype's argmin.
+fn dp_path(e: &[u8], ny: usize, nx: usize, nrm: f64) -> Vec<usize> {
+    let cost = |y: usize, x: usize| -(e[y * nx + x] as f64 / nrm).min(1.0);
+    let mut acc: Vec<f64> = (0..ny).map(|y| cost(y, 0)).collect();
+    let mut next = vec![0.0; ny];
+    let mut back = vec![0i8; ny * nx];
+    for x in 1..nx {
+        for y in 0..ny {
+            let stay = acc[y];
+            let up = if y >= 1 { acc[y - 1] + 0.15 } else { 1e9 };
+            let dn = if y + 1 < ny { acc[y + 1] + 0.15 } else { 1e9 };
+            let (mut v, mut off) = (stay, 0i8);
+            if up < v {
+                v = up;
+                off = -1;
+            }
+            if dn < v {
+                v = dn;
+                off = 1;
+            }
+            next[y] = v + cost(y, x);
+            back[y * nx + x] = off;
+        }
+        std::mem::swap(&mut acc, &mut next);
+    }
+    let mut ys = vec![0usize; nx];
+    let mut y = 0;
+    for (i, &v) in acc.iter().enumerate() {
+        if v < acc[y] {
+            y = i;
+        }
+    }
+    ys[nx - 1] = y;
+    for x in (1..nx).rev() {
+        ys[x - 1] = (ys[x] as isize + back[ys[x] * nx + x] as isize) as usize;
+    }
+    ys
+}
+
+/// Quadratic fit with MAD rejection (feat2.robust_parabola): (coefficients, inliers).
+fn robust_parabola(xs: &[f64], ys: &[f64], mut w: Vec<bool>) -> Option<(Quad, Vec<bool>)> {
+    let count = |w: &[bool]| w.iter().filter(|&&k| k).count();
+    for _ in 0..4 {
+        if count(&w) < 8 {
+            return None;
+        }
+        let c = Quad::fit(xs, ys, &w)?;
+        let r: Vec<f64> = xs.iter().zip(ys).map(|(&x, &y)| y - c.at(x)).collect();
+        let mut ab: Vec<f64> = r.iter().zip(&w).filter(|(_, k)| **k).map(|(v, _)| v.abs()).collect();
+        let s = (1.4826 * vision::median(&mut ab)).max(1.0);
+        let w2: Vec<bool> = w.iter().zip(&r).map(|(&k, v)| k && v.abs() < 2.5 * s).collect();
+        if w2 == w {
+            break;
+        }
+        w = w2;
+    }
+    if count(&w) < 8 {
+        return None;
+    }
+    Some((Quad::fit(xs, ys, &w)?, w))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A synthetic eye: mid-grey skin, a darker iris disc, a black pupil, an upper lid edge, a lens edge band.
+    fn synthetic_eye(px: f64, py: f64, pr: f64) -> Vec<u8> {
+        let mut img = vec![0u8; W * H];
+        for y in 0..H {
+            for x in 0..W {
+                let (dx, dy) = (x as f64 - px, y as f64 - py);
+                let d = dx.hypot(dy);
+                let mut v = if (y as f64) < py - 45.0 { 150.0 } else { 120.0 };
+                if d < 55.0 && (y as f64) >= py - 45.0 {
+                    v = 70.0;
+                }
+                if d < pr {
+                    v = 12.0;
+                }
+                if x >= 350 {
+                    v = 4.0;
+                }
+                img[y * W + x] = v as u8;
+            }
+        }
+        img
+    }
+
+    #[test]
+    fn finds_pupil_and_lids_on_a_synthetic_eye() {
+        let img = synthetic_eye(250.0, 200.0, 25.0);
+        let mut ex = Extractor::default();
+        let xmax = occluder_x(&column_means(&img));
+        assert_eq!(xmax, 347.0);
+        let (f, p) = ex.extract(&img, xmax, None, None, None);
+        let p = p.expect("pupil");
+        assert!((p.cx - 250.0).abs() < 1.0 && (p.cy - 200.0).abs() < 1.0, "{p:?}");
+        assert!((p.a - 25.0).abs() < 1.5 && (p.b - 25.0).abs() < 1.5, "{p:?}");
+        assert!(f.ok_pupil);
+        // The skin line is the bright -> darker step 45 px above the pupil centre.
+        assert!((f.upper_skin_y - 155.0).abs() < 3.0, "{f:?}");
+        assert!(!f.upper_edge);
+        // Without a pupil, lids are still measured at the last pupil's geometry.
+        let blank = vec![120u8; W * H];
+        let (f2, p2) = ex.extract(&blank, xmax, Some((250.0, 200.0)), Some(55.0), Some(&p));
+        assert!(p2.is_none() && !f2.ok_pupil);
+        assert!((f2.box_mean - 120.0).abs() < 1e-9);
+    }
+
+    /// A pupil at (250, 200), radius 25, on skin that is 150 above row `step` and 120 from it down (no iris).
+    fn eye_with_step(step: usize) -> Vec<u8> {
+        eye_with_step_r(step, 25.0)
+    }
+
+    /// `eye_with_step` with a pupil of radius `pr`.
+    fn eye_with_step_r(step: usize, pr: f64) -> Vec<u8> {
+        let mut img = vec![0u8; W * H];
+        for y in 0..H {
+            for x in 0..W {
+                let d = (x as f64 - 250.0).hypot(y as f64 - 200.0);
+                img[y * W + x] = if x >= 350 {
+                    4
+                } else if d < pr {
+                    12
+                } else if y < step {
+                    150
+                } else {
+                    120
+                };
+            }
+        }
+        img
+    }
+
+    #[test]
+    fn an_upper_lid_line_pushed_against_the_band_edge_is_no_line() {
+        let mut ex = Extractor::default();
+        // Lids at R = 55: the upper band is rows 84..224. A step through the middle of it is the line.
+        let (f, p) = ex.extract(&eye_with_step(200), 347.0, None, Some(55.0), None);
+        assert!(p.is_some() && !f.upper_edge && (f.upper_skin_y - 200.0).abs() < 3.0, "{f:?}");
+        // The only step on the band's last rows: the path is pushed against its edge, no upper lid line.
+        let (f, p) = ex.extract(&eye_with_step(223), 347.0, None, Some(55.0), None);
+        assert!(p.is_some() && f.ok_pupil && f.upper_edge, "{f:?}");
+        assert!(f.upper_skin_y.is_nan() && f.upper_y.is_nan() && f.upper_frac.is_nan(), "{f:?}");
+        assert!(f.upper_curve.is_none(), "{f:?}");
+        // The rows of a band as the path sees them: a line on its first two or last two rows is on the edge, one row
+        // further in it is a line.
+        let pupil = p.unwrap();
+        let mut at = |row: usize| {
+            ex.gy.iter_mut().for_each(|g| *g = 0);
+            for x in 150..300 {
+                ex.gy[row * W + x] = -100;
+            }
+            ex.lid_line(&pupil, (150, 300), (100, 160), (100, 160), true).map(|u| (u.y_at.round(), u.on_edge()))
+        };
+        assert_eq!(at(130), Some((130.0, false)));
+        assert_eq!(at(102), Some((102.0, false)));
+        assert_eq!(at(157), Some((157.0, false)));
+        assert_eq!(at(101), Some((101.0, true)));
+        assert_eq!(at(100), Some((100.0, true)));
+        assert_eq!(at(158), Some((158.0, true)));
+        assert_eq!(at(159), Some((159.0, true)));
+        // Nothing in the band: no line either way.
+        ex.gy.iter_mut().for_each(|g| *g = 0);
+        assert!(ex.lid_line(&pupil, (150, 300), (100, 160), (100, 160), true).is_none());
+    }
+
+    /// A pupil at (250, 200), radius 25, on grey 120 that turns 160 from row `step` down (a dark -> bright step: the
+    /// lower lid's kind) and 150 above row 150 (the upper lid's skin line).
+    fn eye_with_lower_step(step: usize) -> Vec<u8> {
+        let mut img = eye_with_step(150);
+        for y in step..H {
+            for x in 0..350 {
+                if (x as f64 - 250.0).hypot(y as f64 - 200.0) >= 25.0 {
+                    img[y * W + x] = 160;
+                }
+            }
+        }
+        img
+    }
+
+    #[test]
+    fn a_lower_lid_line_pushed_against_the_far_edge_of_its_band_is_no_line() {
+        let mut ex = Extractor::default();
+        // Lids at R = 55: the lower band is rows 213..304. A step through the middle of it is the line.
+        let (f, p) = ex.extract(&eye_with_lower_step(260), 347.0, None, Some(55.0), None);
+        assert!(p.is_some() && !f.lower_edge && (f.lower_y - 260.0).abs() < 3.0, "{f:?}");
+        // The lines' shapes for the eye preview: the same lines, over the iris columns
+        let (up, low) = (f.upper_curve.expect("upper"), f.lower_curve.expect("lower"));
+        assert_eq!((up.coef.at(f.pupil_cx), low.coef.at(f.pupil_cx)), (f.upper_skin_y, f.lower_y));
+        assert!(up.x0 < f.pupil_cx && f.pupil_cx < up.x1 && (low.x0, low.x1) == (up.x0, up.x1), "{up:?}");
+        // The only step on the band's last rows: no lower line, with the pupil ...
+        let (f, p) = ex.extract(&eye_with_lower_step(304), 347.0, None, Some(55.0), None);
+        let pupil = p.expect("pupil");
+        assert!(f.ok_pupil && f.lower_edge && f.lower_y.is_nan() && f.lower_frac.is_nan(), "{f:?}");
+        assert!(f.lower_curve.is_none() && f.upper_curve.is_some(), "{f:?}");
+        assert!(!f.upper_edge && (f.upper_skin_y - 150.0).abs() < 3.0, "the upper line stays: {f:?}");
+        // ... and without it (measured where the last pupil was).
+        let blank = eye_with_lower_step(304).iter().map(|&v| if v == 12 { 120 } else { v }).collect::<Vec<u8>>();
+        let (f, p) = ex.extract(&blank, 347.0, Some((250.0, 200.0)), Some(55.0), Some(&pupil));
+        assert!(p.is_none() && f.lower_edge && f.lower_y.is_nan(), "{f:?}");
+        // Only the far edge counts for the lower line: on the band's first rows it is a line (a closing eye's lines
+        // meet there).
+        let mut at = |row: usize| {
+            ex.gy.iter_mut().for_each(|g| *g = 0);
+            for x in 150..300 {
+                ex.gy[row * W + x] = 100;
+            }
+            ex.lid_line(&pupil, (150, 300), (100, 160), (100, 160), false).map(|l| (l.y_at.round(), l.on_far_edge()))
+        };
+        assert_eq!(at(100), Some((100.0, false)));
+        assert_eq!(at(101), Some((101.0, false)));
+        assert_eq!(at(157), Some((157.0, false)));
+        assert_eq!(at(158), Some((158.0, true)));
+        assert_eq!(at(159), Some((159.0, true)));
+    }
+
+    #[test]
+    fn an_upper_lid_line_below_the_centre_of_a_whole_pupil_is_no_line() {
+        let mut ex = Extractor::default();
+        // A bright -> dark step 20 px below the centre of a pupil (radius 12) drawn whole: no upper lid line.
+        let (f, p) = ex.extract(&eye_with_step_r(220, 12.0), 347.0, None, Some(55.0), None);
+        let p = p.expect("pupil");
+        assert!(p.vis >= UPPER_WHOLE_VIS, "{p:?}");
+        assert!(f.upper_edge && f.upper_skin_y.is_nan() && f.upper_y.is_nan(), "{f:?}");
+        // Above the centre it is the line.
+        let (f, _) = ex.extract(&eye_with_step_r(180, 12.0), 347.0, None, Some(55.0), None);
+        assert!(!f.upper_edge && (f.upper_skin_y - 180.0).abs() < 3.0, "{f:?}");
+    }
+
+    #[test]
+    fn a_line_below_a_whole_pupils_top_is_searched_for_again_above_it() {
+        let mut ex = Extractor::default();
+        // A strong bright -> dark step 20 px below the centre (a brightly lit white of the eye over the lower lid) and a
+        // weaker one 50 px above it (the lid): the line is the one above the pupil.
+        let mut img = eye_with_step_r(220, 12.0);
+        for y in 0..150 {
+            for x in 0..350 {
+                if img[y * W + x] == 150 {
+                    img[y * W + x] = 170;
+                }
+            }
+        }
+        let (f, p) = ex.extract(&img, 347.0, None, Some(55.0), None);
+        assert!(p.expect("pupil").vis >= UPPER_WHOLE_VIS);
+        assert!(!f.upper_edge && (f.upper_skin_y - 150.0).abs() < 3.0, "{f:?}");
+        // Without a pupil this frame (measured where the last one was) there is no second search.
+        let pupil = p.unwrap();
+        let blank = img.iter().map(|&v| if v == 12 { 150 } else { v }).collect::<Vec<u8>>();
+        let (f, p) = ex.extract(&blank, 347.0, Some((250.0, 200.0)), Some(55.0), Some(&pupil));
+        assert!(p.is_none() && (f.upper_skin_y - 220.0).abs() < 3.0, "{f:?}");
+        // A line 2 px under ABOVE_PUPIL_B of the pupil's radius above its centre is searched for again too.
+        let low = (200.0 - ABOVE_PUPIL_B * 12.0 + 2.0).round() as usize;
+        let mut img = eye_with_step_r(low, 12.0);
+        for y in 0..150 {
+            for x in 0..350 {
+                if img[y * W + x] == 150 {
+                    img[y * W + x] = 170;
+                }
+            }
+        }
+        let (f, p) = ex.extract(&img, 347.0, None, Some(55.0), None);
+        let p = p.expect("pupil");
+        assert!(p.vis >= UPPER_WHOLE_VIS && (low as f64) > p.cy - ABOVE_PUPIL_B * p.b, "{p:?}");
+        assert!(!f.upper_edge && (f.upper_skin_y - 150.0).abs() < 3.0, "{f:?}");
+    }
+
+    #[test]
+    fn a_lid_above_the_search_again_line_stays_the_line() {
+        let mut ex = Extractor::default();
+        // The lid's step 3 px above ABOVE_PUPIL_B of a whole pupil's radius (12) above its centre (at 0.5 a lid that
+        // touches the pupil in a shallow squint), and a weaker crease 50 px above: the lid stays the line.
+        let step = (200.0 - ABOVE_PUPIL_B * 12.0 - 3.0).round() as usize;
+        let mut img = eye_with_step_r(step, 12.0);
+        for y in 0..150 {
+            for x in 0..350 {
+                if img[y * W + x] == 150 {
+                    img[y * W + x] = 165;
+                }
+            }
+        }
+        let (f, p) = ex.extract(&img, 347.0, None, Some(55.0), None);
+        let p = p.expect("pupil");
+        assert!(p.vis >= UPPER_WHOLE_VIS && (step as f64) < p.cy - ABOVE_PUPIL_B * p.b, "{p:?}");
+        assert!(!f.upper_edge && (f.upper_skin_y - step as f64).abs() < 3.0, "{f:?}");
+    }
+
+    /// Pupil (12, radius 18) at (230, 200) in an iris (70, radius 45) on sclera (120), a ring of brighter iris (85) at
+    /// radius 28..34, the lens edge band from x 350, and from x `band` on a band of `level` (not saturated).
+    fn eye_with_band(band: usize, level: u8) -> Vec<u8> {
+        let mut img = vec![120u8; W * H];
+        for y in 0..H {
+            for x in 0..W {
+                let d = (x as f64 - 230.0).hypot(y as f64 - 200.0);
+                img[y * W + x] = if x >= 350 {
+                    4
+                } else if x >= band {
+                    level
+                } else if d < 18.0 {
+                    12
+                } else if (28.0..34.0).contains(&d) {
+                    85
+                } else if d < 45.0 {
+                    70
+                } else {
+                    120
+                };
+            }
+        }
+        img
+    }
+
+    #[test]
+    fn the_iris_radius_is_the_first_rise_out_of_the_iris_not_a_brighter_band_beyond() {
+        // As built the strongest rise is taken: the band's edge.
+        let mut ex = Extractor::default();
+        let (f, _) = ex.extract(&eye_with_band(305, 200), 347.0, None, None, None);
+        assert!(f.ok_pupil && (f.iris_r - 75.0).abs() < 3.0, "{f:?}");
+        let mut ex = Extractor { iris_first: true, ..Extractor::default() };
+        // No band: the limbus, not the fainter ring inside the iris.
+        let (f, _) = ex.extract(&eye_with_band(400, 0), 347.0, None, None, None);
+        assert!(f.ok_pupil && (f.iris_r - 45.0).abs() < 2.5, "{f:?}");
+        // A band 75 px out, brighter than the sclera: its edge is the strongest rise on the rays toward it, but the
+        // limbus comes first.
+        let (f, _) = ex.extract(&eye_with_band(305, 200), 347.0, None, None, None);
+        assert!(f.ok_pupil && (f.iris_r - 45.0).abs() < 2.5, "{f:?}");
+        // With the band right at the limbus there is one rise, the limbus's.
+        let (f, _) = ex.extract(&eye_with_band(275, 200), 347.0, None, None, None);
+        assert!(f.ok_pupil && (f.iris_r - 45.0).abs() < 2.5, "{f:?}");
+    }
+    #[test]
+    fn the_higher_band_finds_a_widened_lid_above_the_usual_one() {
+        let mut ex = Extractor::default();
+        // A lid 2.6 R (143 px) above the pupil centre: above the usual band (from row 84), inside the higher one
+        // (rows 24..112).
+        let (f, p) = ex.extract(&eye_with_step(57), 347.0, None, Some(55.0), None);
+        let p = p.expect("pupil");
+        assert!(f.upper_skin_y.is_nan() || f.upper_skin_y > 84.0, "the usual band does not reach it: {f:?}");
+        let (y, frac) = ex.upper_high(&p, 347.0).expect("a line in the higher band");
+        assert!((y - 57.0).abs() < 3.0 && frac > 0.9, "{y} {frac}");
+        // A lid in the usual band (1.0 R): the higher band has nothing.
+        let (_, p) = ex.extract(&eye_with_step(145), 347.0, None, Some(55.0), None);
+        assert_eq!(ex.upper_high(&p.unwrap(), 347.0), None);
+    }
+
+    /// Temporal shading: everything left of x = 186 as dark as a pupil, with a 40 x 70 bulge into the search window.
+    fn shade(img: &mut [u8]) {
+        for y in 0..H {
+            for x in 0..W {
+                if x < 186 || (x < 226 && (160..230).contains(&y)) {
+                    img[y * W + x] = 14;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_pupil_cut_by_the_left_edge_is_found_live_but_not_by_the_prototype() {
+        // The pupil spans x 175..225: the window's left edge (186) cuts it.
+        let img = synthetic_eye(200.0, 200.0, 25.0);
+        let mut ex = Extractor::default();
+        let (f, p) = ex.extract(&img, 347.0, None, None, None);
+        assert!(p.is_none() && !f.ok_pupil, "the prototype drops blobs touching the left edge");
+        assert!(f.diag.rejected & REJ_LEFT != 0, "{:?}", f.diag);
+        ex.search = Search::live(X_MIN);
+        let (f, p) = ex.extract(&img, 347.0, None, None, None);
+        let p = p.expect("pupil");
+        assert!((p.cx - 200.0).abs() < 1.5 && (p.cy - 200.0).abs() < 1.5 && (p.a - 25.0).abs() < 1.5, "{p:?}");
+        assert!(f.diag.left_edge && f.diag.candidates >= 1, "{:?}", f.diag);
+        // With the prior somewhere else, it is still found.
+        let (_, p) = ex.extract(&img, 347.0, Some((300.0, 120.0)), None, None);
+        assert!(p.is_some_and(|p| (p.cx - 200.0).abs() < 1.5));
+    }
+
+    #[test]
+    fn dark_shading_at_the_left_edge_is_not_a_pupil() {
+        let mut img = vec![120u8; W * H];
+        for v in img.iter_mut().skip(350).step_by(W) {
+            *v = 4;
+        }
+        shade(&mut img);
+        let mut ex = Extractor { search: Search::live(X_MIN), ..Extractor::default() };
+        let (f, p) = ex.extract(&img, 347.0, None, None, None);
+        assert!(p.is_none() && !f.ok_pupil, "{p:?}");
+        assert!(f.diag.candidates >= 1, "the bulge is a candidate, refused for its missing left edge: {:?}", f.diag);
+        // With a real pupil beside it, the pupil is found even though the bulge scores higher.
+        let mut img = synthetic_eye(275.0, 195.0, 22.0);
+        shade(&mut img);
+        let (f, p) = ex.extract(&img, 347.0, None, None, None);
+        let p = p.expect("pupil");
+        assert!((p.cx - 275.0).abs() < 1.5 && (p.cy - 195.0).abs() < 1.5, "{p:?}");
+        assert!(!f.diag.left_edge && f.diag.candidates >= 2, "{:?}", f.diag);
+    }
+
+    #[test]
+    fn rays_left_of_the_computed_columns_do_not_count() {
+        // Only x >= 200 belongs to this frame; left of it are an earlier frame's bright pixels, which would look
+        // like the pupil's edge on the rays pointing left.
+        let mut ex = Extractor { opf: vec![120; W * H], opf_x0: 200, ..Extractor::default() };
+        for y in 0..H {
+            for x in 0..W {
+                if (x as f64 - 205.0).hypot(y as f64 - 200.0) < 20.0 {
+                    ex.opf[y * W + x] = 12;
+                }
+            }
+        }
+        let (p, left_share) = ex.refine_pupil((205.0, 200.0), 20.0, 347.0).expect("the other rays still fit it");
+        assert!((p.cy - 200.0).abs() < 1.5 && (p.a - 20.0).abs() < 2.0, "{p:?}");
+        assert!(left_share.is_nan() || left_share < EDGE_LEFT_SHARE, "no left ray reached only this frame's columns: {left_share}");
+        ex.opf_x0 = 0;
+        assert!(ex.refine_pupil((205.0, 200.0), 20.0, 347.0).is_some_and(|x| x.1 >= EDGE_LEFT_SHARE));
+    }
+
+    #[test]
+    fn the_extended_search_finds_a_pupil_past_the_window_edge_and_measures_the_rest_at_x_min() {
+        // The pupil spans x 138..182, all of it left of the window's edge at 186.
+        let img = synthetic_eye(160.0, 200.0, 22.0);
+        let mut ex = Extractor { search: Search::live(186.0), ..Extractor::default() };
+        let (f, p) = ex.extract(&img, 347.0, Some((165.0, 200.0)), Some(55.0), None);
+        assert!(p.is_none() && !f.diag.ext_tried, "no extended search with find_x_min = x_min: {:?}", f.diag);
+        // From 162: found (the blob cut by 162, its left edge on the rays pointing left)
+        ex.search = Search::live_ext(186.0, 162.0, ExtCheck::ANY);
+        let (f, p) = ex.extract(&img, 347.0, Some((165.0, 200.0)), Some(55.0), None);
+        let p = p.expect("pupil");
+        assert!((p.cx - 160.0).abs() < 1.5 && (p.a - 22.0).abs() < 1.5, "{p:?}");
+        assert!(f.ok_pupil && f.diag.ext_tried && f.diag.extended && f.diag.x_min == 186.0, "{:?}", f.diag);
+        // The lids and the box are measured as for the same pupil lost there: from x_min, not from 162
+        let mut lost = Extractor { search: Search::live(186.0), ..Extractor::default() };
+        let (g, _) = lost.extract(&img, 347.0, None, Some(55.0), Some(&p));
+        assert!(!g.ok_pupil && g.box_mean.is_finite());
+        assert_eq!((f.box_mean, f.upper_skin_y, f.lower_y), (g.box_mean, g.upper_skin_y, g.lower_y));
+        // Refused by the check (too big for the open pupil): not found, and measured where the last pupil was
+        let check = ExtCheck { a: (30.0, 40.0), ..ExtCheck::ANY };
+        ex.search = Search::live_ext(186.0, 162.0, check);
+        let (f, p2) = ex.extract(&img, 347.0, Some((165.0, 200.0)), Some(55.0), Some(&p));
+        assert!(p2.is_none() && !f.diag.extended && f.diag.ext_refused, "{:?}", f.diag);
+        assert_eq!(f.box_mean, g.box_mean);
+        // Off its track, or Valve says the eye is closing: not found either (no extended search at all for the latter)
+        ex.search = Search::live_ext(186.0, 162.0, ExtCheck { near: Some((250.0, 200.0, 40.0)), ..ExtCheck::ANY });
+        assert!(ex.extract(&img, 347.0, None, Some(55.0), None).1.is_none());
+        ex.search = Search::live_ext(186.0, 162.0, ExtCheck { closing: true, ..ExtCheck::ANY });
+        let (f, p2) = ex.extract(&img, 347.0, None, Some(55.0), None);
+        assert!(p2.is_none() && !f.diag.ext_tried);
+        // A pupil the window finds itself is the first pass's, as before
+        let inside = synthetic_eye(250.0, 200.0, 22.0);
+        ex.search = Search::live_ext(186.0, 162.0, ExtCheck::ANY);
+        let (f, p) = ex.extract(&inside, 347.0, None, None, None);
+        assert!(p.is_some() && !f.diag.ext_tried && !f.diag.extended);
+        // The extended edge is never right of x_min, nor left of X_MIN_LO
+        assert_eq!(Search::live_ext(186.0, 200.0, ExtCheck::ANY).find_x_min, 186.0);
+        assert_eq!(Search::live_ext(110.0, 80.0, ExtCheck::ANY).find_x_min, X_MIN_LO);
+    }
+
+    /// Issue 52's picture: the eye at the small-x edge of the lit part, the pupil (9) in the dim part with its iris
+    /// there only 10 levels brighter (19), dark shading (8) further out, and the sclera and skin bright from x 230 on.
+    fn dim_side_eye(px: f64, py: f64, pr: f64) -> Vec<u8> {
+        let mut img = vec![0u8; W * H];
+        for y in 0..H {
+            for x in 0..W {
+                let d = (x as f64 - px).hypot(y as f64 - py);
+                let lit = x >= 230;
+                let mut v = if x < 150 { 8.0 } else if lit { 130.0 } else { 28.0 };
+                if d < 50.0 {
+                    v = if lit { 60.0 } else { 19.0 };
+                }
+                if d < pr {
+                    v = 9.0;
+                }
+                if x >= 350 {
+                    v = 4.0;
+                }
+                img[y * W + x] = v as u8;
+            }
+        }
+        img
+    }
+
+    #[test]
+    fn the_dim_side_search_finds_a_pupil_in_the_dim_part_of_the_picture() {
+        let img = dim_side_eye(198.0, 200.0, 17.0);
+        let cm = column_means(&img);
+        let levels = Levels::for_profile(&cm);
+        let dim = levels.dim_side(&cm, 162.0, 206.0).expect("the dim side is much dimmer than the picture");
+        assert!(dim.k < 0.2 + 1e-9 && dim.moved, "{dim:?} {levels:?}");
+        // The usual passes: the pupil merges with the shaded iris and the shading
+        let mut ex = Extractor { search: Search::live_ext(186.0, 162.0, ExtCheck::ANY), ..Extractor::default() };
+        let (f, p) = ex.extract(&img, 347.0, None, None, None);
+        assert!(p.is_none() && f.diag.ext_tried && !f.diag.dim, "{:?}", f.diag);
+        // With the dim side's levels: found, and only by that pass; the lids and the box still from x_min
+        ex.search.dim = Some(DimSearch { x0: 162.0, levels: dim, check: ExtCheck::ANY });
+        let (f, p) = ex.extract(&img, 347.0, None, None, None);
+        let p = p.expect("pupil");
+        assert!((p.cx - 198.0).abs() < 1.5 && (p.cy - 200.0).abs() < 1.5 && (p.a - 17.0).abs() < 1.5, "{p:?}");
+        assert!(f.ok_pupil && f.diag.dim && !f.diag.extended && f.diag.x_min == 186.0, "{:?}", f.diag);
+        assert_eq!(ex.levels, Levels::AS_BUILT, "the levels go back after the pass");
+        // Refused by its check, or Valve says the eye is closing: not found
+        ex.search.dim = Some(DimSearch { x0: 162.0, levels: dim, check: ExtCheck { a: (30.0, 40.0), ..ExtCheck::ANY } });
+        let (f, p) = ex.extract(&img, 347.0, None, None, None);
+        assert!(p.is_none() && !f.diag.dim && f.diag.dim_refused, "{:?}", f.diag);
+        ex.search.dim = Some(DimSearch { x0: 162.0, levels: dim, check: ExtCheck::ANY });
+        ex.search.ext.closing = true;
+        let (f, p) = ex.extract(&img, 347.0, None, None, None);
+        assert!(p.is_none() && !f.diag.dim);
+        // A pupil the usual passes find comes out exactly as without the dim-side search
+        let inside = synthetic_eye(250.0, 200.0, 22.0);
+        let mut a = Extractor { search: Search::live_ext(186.0, 162.0, ExtCheck::ANY), ..Extractor::default() };
+        let mut b = Extractor { search: Search::live_ext(186.0, 162.0, ExtCheck::ANY), ..Extractor::default() };
+        b.search.dim = Some(DimSearch { x0: 162.0, levels: dim, check: ExtCheck::ANY });
+        let (fa, pa) = a.extract(&inside, 347.0, None, None, None);
+        let (fb, pb) = b.extract(&inside, 347.0, None, None, None);
+        assert!(pb.is_some() && !fb.diag.dim);
+        assert_eq!(format!("{fa:?} {pa:?}"), format!("{fb:?} {pb:?}"));
+        // The picture's own levels where the part around the edge is as bright as the rest: no dim-side search
+        let even = synthetic_eye(250.0, 200.0, 22.0);
+        let cm = column_means(&even);
+        assert_eq!(Levels::for_profile(&cm).dim_side(&cm, 162.0, 206.0), None);
+    }
+
+    #[test]
+    fn the_extended_search_leaves_the_first_pass_as_it_was() {
+        // Shading left of 186 with a bulge into the window, and a pupil the first pass finds: the same pupil and the same
+        // features whether the extended search is on or not (it only runs when the first pass finds nothing).
+        let mut img = synthetic_eye(275.0, 195.0, 22.0);
+        shade(&mut img);
+        let mut a = Extractor { search: Search::live(186.0), ..Extractor::default() };
+        let mut b = Extractor { search: Search::live_ext(186.0, 162.0, ExtCheck::ANY), ..Extractor::default() };
+        let (fa, pa) = a.extract(&img, 347.0, None, None, None);
+        let (fb, pb) = b.extract(&img, 347.0, None, None, None);
+        assert_eq!(format!("{fa:?} {pa:?}"), format!("{fb:?} {pb:?}"));
+        // The shading alone is not a pupil for the extended search either
+        let mut img = vec![120u8; W * H];
+        for v in img.iter_mut().skip(350).step_by(W) {
+            *v = 4;
+        }
+        shade(&mut img);
+        let (f, p) = b.extract(&img, 347.0, None, None, None);
+        assert!(p.is_none() && f.diag.ext_tried && !f.diag.extended, "{:?}", f.diag);
+    }
+
+    #[test]
+    fn the_search_window_follows_the_temporal_shading() {
+        let profile = |end: usize| (0..W).map(|x| if x < end { 8.0 } else { 80.0 }).collect::<Vec<f64>>();
+        assert_eq!(search_x_min(&profile(198)), X_MIN, "the developer's recordings: the prototype's edge");
+        assert_eq!(search_x_min(&profile(150)), 140.0);
+        assert_eq!(search_x_min(&profile(40)), X_MIN_LO);
+        assert_eq!(search_x_min(&vec![10.0; W]), X_MIN, "no bright columns: the prototype's edge");
+        assert_eq!(search_x_min(&profile(230)), X_MIN, "shading past the prototype's edge: it stays");
+        // Lit skin at x 60..100 with shading between it and the iris: the shading's end counts.
+        let mut beyond = profile(150);
+        beyond[60..100].fill(90.0);
+        assert_eq!(search_x_min(&beyond), 140.0);
+        assert_eq!(Search::live(20.0).x_min, X_MIN_LO);
+        // Where each came from (the drift log)
+        assert_eq!(search_x_min_from(&profile(198)), (X_MIN, XMinFrom::Fixed));
+        assert_eq!(search_x_min_from(&profile(196)), (X_MIN, XMinFrom::Shade));
+        assert_eq!(search_x_min_from(&profile(150)), (140.0, XMinFrom::Shade));
+        assert_eq!(search_x_min_from(&profile(40)), (X_MIN_LO, XMinFrom::Floor));
+        assert_eq!(search_x_min_from(&profile(230)), (X_MIN, XMinFrom::Fixed));
+        // A pupil left of the prototype's window is found with the window moved left.
+        let mut img = synthetic_eye(170.0, 200.0, 24.0);
+        for y in 0..H {
+            for x in 0..100 {
+                img[y * W + x] = 8;
+            }
+        }
+        let mut ex = Extractor { search: Search::live(search_x_min(&column_means(&img))), ..Extractor::default() };
+        assert!(ex.search.x_min < 120.0, "{:?}", ex.search);
+        let (f, p) = ex.extract(&img, 347.0, None, None, None);
+        assert!(p.is_some_and(|p| (p.cx - 170.0).abs() < 1.5), "{p:?}");
+        assert!(f.upper_skin_y.is_finite() && f.box_mean.is_finite(), "{f:?}");
+    }
+
+    /// `img` with every grey level times `g` (a dimmer camera picture), rounded.
+    fn dimmed(img: &[u8], g: f64) -> Vec<u8> {
+        img.iter().map(|&v| (v as f64 * g).round() as u8).collect()
+    }
+
+    #[test]
+    fn the_levels_stay_as_built_at_full_brightness() {
+        // The developer's recordings: black vignette and lens band ~4.3, sclera and skin 150..180 around the iris.
+        let mut cm = vec![4.3; W];
+        cm[150..200].iter_mut().enumerate().for_each(|(i, v)| *v = 4.3 + 3.0 * i as f64);
+        cm[200..330].fill(165.0);
+        cm[330..347].fill(100.0);
+        assert_eq!(Levels::from_profile(&cm), Levels::AS_BUILT);
+        assert_eq!((Levels::AS_BUILT.level(40.0), Levels::AS_BUILT.step(14.0)), (40.0, 14.0));
+        // Half as bright: every step about halves (this profile spans a little less than the typical one), every level
+        // moves toward the black with it.
+        let half: Vec<f64> = cm.iter().map(|v| v * 0.5).collect();
+        let lv = Levels::from_profile(&half);
+        assert!(lv.moved && (lv.k - 0.484).abs() < 0.001, "{lv:?}");
+        assert!((lv.level(40.0) - (2.15 + lv.k * 36.0)).abs() < 1e-9 && (lv.step(14.0) - 14.0 * lv.k).abs() < 1e-9);
+        // Between dim and full brightness the factor goes over to 1 without a jump.
+        let at = |b: f64| Levels::from_profile(&cm.iter().map(|&v| if v > 100.0 { b } else { v }).collect::<Vec<_>>());
+        assert_eq!(at(141.0), Levels::AS_BUILT);
+        assert!(at(140.2).k > 0.995 && (at(120.3).k - 116.0 / 166.0).abs() < 1e-9 && at(130.0).k > at(120.3).k);
+        // Ratios of levels (the iris box against the open eye's) are taken back at full brightness.
+        assert!((lv.unlevel(lv.level(57.0)) - 57.0).abs() < 1e-9 && Levels::AS_BUILT.unlevel(57.0) == 57.0);
+        // A lifted black (haze) moves the levels up even at full contrast, and a squeezed span scales the steps.
+        let hazy: Vec<f64> = cm.iter().map(|v| v + 30.0).collect();
+        let lv = Levels::from_profile(&hazy);
+        assert!(lv.moved && lv.k == 1.0 && (lv.level(25.0) - 55.3).abs() < 1e-9, "{lv:?}");
+        let hazy: Vec<f64> = cm.iter().map(|v| 0.5 * v + 40.0).collect();
+        let lv = Levels::from_profile(&hazy);
+        assert!(lv.moved && (lv.k - 0.484).abs() < 0.001 && (lv.dark - 42.15).abs() < 1e-9, "{lv:?}");
+    }
+
+    #[test]
+    fn a_glare_band_ends_the_picture_and_is_no_measure_of_brightness() {
+        // A saturated band over the nasal quarter (x 300..388; the lens's dark rim beyond stays), with a soft edge.
+        let band = |img: &mut Vec<u8>| {
+            for y in 0..H {
+                for x in 296..388 {
+                    let w = ((x as f64 - 296.0) / 8.0).min(1.0);
+                    let v = &mut img[y * W + x];
+                    *v = (*v as f64 * (1.0 - w) + 255.0 * w).round() as u8;
+                }
+            }
+        };
+        let img = synthetic_eye(250.0, 200.0, 25.0);
+        assert!(glare_columns(&column_means(&img)).iter().all(|&g| !g), "no band: nothing changes");
+        let mut glared = img.clone();
+        band(&mut glared);
+        assert_eq!(glare_edge(&column_means(&img)), None);
+        let xmax = glare_edge(&column_means(&glared)).expect("glare");
+        assert!((280.0..296.0).contains(&xmax), "the picture ends before the glare, not past it at the rim: {xmax}");
+        assert!(occluder_x(&column_means(&glared)) > 380.0, "the lens rim past the glare");
+        // Dim and glared: the factor is the dim picture's, not the glare's.
+        let mut dim = dimmed(&img, 0.5);
+        let k = Levels::from_profile(&column_means(&dim)).k;
+        band(&mut dim);
+        let cm = column_means(&dim);
+        assert!(!Levels::from_profile(&cm).moved, "the glare reads as full brightness");
+        let lv = Levels::from_profile_without(&cm, &glare_columns(&cm));
+        assert!(lv.moved && (lv.k - k).abs() < 0.05, "{lv:?} vs {k}");
+        // A dim profile with a glare band past the iris: the window follows the shading as without the band (the
+        // glare is no measure of the brightness here either).
+        let dim_profile = |band: bool| {
+            (0..W).map(|x| if band && x >= 300 { 255.0 } else if x < 150 { 3.2 } else { 32.0 }).collect::<Vec<f64>>()
+        };
+        assert_eq!(search_x_min_from(&dim_profile(false)), (140.0, XMinFrom::Shade));
+        assert_eq!(glare_end(&dim_profile(true)), Some(289.0));
+        assert_eq!(search_x_min_from(&dim_profile(true)), (140.0, XMinFrom::Shade));
+        // A temporal band next to the bright region is not part of it: the search window stops at its soft edge.
+        let profile = (0..W).map(|x| if x < 12 { 5.0 } else if x < 150 { 255.0 } else { 80.0 });
+        assert_eq!(search_x_min_from(&profile.collect::<Vec<f64>>()), (148.0, XMinFrom::Shade));
+    }
+
+    #[test]
+    fn a_dimmer_picture_keeps_the_lens_edge_and_the_search_window() {
+        let img = synthetic_eye(250.0, 200.0, 25.0);
+        assert_eq!(occluder_x(&column_means(&dimmed(&img, 0.4))), occluder_x(&column_means(&img)));
+        // The shading's end at x = 150 (x_min 140) still counts at 0.4 x the brightness (columns 3 and 32: the fixed
+        // level 40 would put the whole picture in the shading).
+        let profile = |end: usize, g: f64| (0..W).map(|x| g * if x < end { 8.0 } else { 80.0 }).collect::<Vec<f64>>();
+        assert_eq!(search_x_min(&profile(150, 1.0)), 140.0);
+        assert_eq!(search_x_min(&profile(150, 0.4)), 140.0);
+        assert_eq!(search_x_min_from(&profile(198, 0.4)), (X_MIN, XMinFrom::Fixed));
+        // A lens band lifted by haze is still the lens band.
+        let hazy: Vec<u8> = img.iter().map(|&v| (v as f64 * 0.6 + 40.0) as u8).collect();
+        assert_eq!(occluder_x(&column_means(&hazy)), occluder_x(&column_means(&img)));
+    }
+
+    #[test]
+    fn a_dimmer_picture_keeps_the_pupil_apart_from_the_dark_ring_around_it() {
+        // A pupil (radius 20, level 12) in a darker ring (to radius 34, level 32: lashes' shade, a dark iris rim)
+        // inside the iris (70). The threshold steps above the window's dark level keep the ring out at full
+        // brightness; at half the brightness the ring is 16, under the darkest level + 14, and the "pupil" grows to
+        // the ring.
+        let mut img = synthetic_eye(250.0, 200.0, 20.0);
+        for y in 0..H {
+            for x in 0..W {
+                let d = (x as f64 - 250.0).hypot(y as f64 - 200.0);
+                if (20.0..34.0).contains(&d) {
+                    img[y * W + x] = 32;
+                }
+            }
+        }
+        let find = |img: &[u8], levels: Levels| {
+            let mut ex = Extractor { levels, ..Extractor::default() };
+            ex.extract(img, 347.0, None, None, None).1.expect("pupil")
+        };
+        let p = find(&img, Levels::AS_BUILT);
+        assert!((p.a - 20.0).abs() < 1.5, "{p:?}");
+        let dim = dimmed(&img, 0.5);
+        assert!(find(&dim, Levels::AS_BUILT).a > 28.0, "the fixed steps take the ring in");
+        let p = find(&dim, Levels::from_profile(&column_means(&dim)));
+        assert!((p.a - 20.0).abs() < 1.5 && (p.cx - 250.0).abs() < 1.0 && (p.cy - 200.0).abs() < 1.0, "{p:?}");
+    }
+}
+
+/// Stage timings on real frames: `EYECAM_SESSION=dir cargo test --release -- --ignored bench_stages --nocapture`.
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    #[ignore]
+    fn bench_stages() {
+        let s = crate::replay::Session::open(std::path::Path::new(&std::env::var("EYECAM_SESSION").unwrap()), false).unwrap();
+        let mut img = vec![0u8; W * H];
+        let mut ex = Extractor::default();
+        let n = 300;
+        let mut t = [0f64; 5];
+        let mut prev = None;
+        let mut prev_p: Option<Pupil> = None;
+        for k in 0..n {
+            s.read(0, 1000 + k, &mut img).unwrap();
+            let a = Instant::now();
+            vision::open9_cols(&img, W, H, OPEN_X0, W, &mut ex.morph, &mut ex.op);
+            let b = Instant::now();
+            vision::gauss_u8(&ex.op, W, H, &ex.k1, Rect { x0: OPF_X0, y0: 0, x1: W, y1: H }, &mut ex.gauss, &mut ex.opf);
+            let c = Instant::now();
+            ex.find_pupil_blob(ex.search.x_min, 346.0, prev, &mut Diag::default());
+            let d = Instant::now();
+            let p = ex.cands.first().copied().and_then(|b| ex.refine_pupil(b.c, b.r, 346.0));
+            let e = Instant::now();
+            let (_, p2) = ex.extract(&img, 346.0, prev, Some(54.0), prev_p.as_ref());
+            let f = Instant::now();
+            if let Some(p) = p2 {
+                prev = Some((p.cx, p.cy));
+                prev_p = Some(p);
+            }
+            let _ = p;
+            for (i, (x, y)) in [(a, b), (b, c), (c, d), (d, e), (e, f)].iter().enumerate() {
+                t[i] += (*y - *x).as_secs_f64() * 1e3 / n as f64;
+            }
+        }
+        eprintln!("ms/frame: open {:.2} blur {:.2} blob {:.2} rays {:.2} | whole extract {:.2}", t[0], t[1], t[2], t[3], t[4]);
+    }
+}

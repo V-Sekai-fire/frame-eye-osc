@@ -169,6 +169,27 @@ struct fe_learned {
   fe_avatar_param params[512];
 };
 
+struct fe_cam_eye {
+  int32_t usable;
+  int32_t closed;
+  float lid;
+  float wide;
+  float squint;
+  float pupil_ratio;
+  float pupil_mm;
+  float pupil_dilation;
+  float confidence;
+};
+
+struct fe_cam_page {
+  int32_t status;
+  fe_cam_eye left;
+  fe_cam_eye right;
+};
+
+fe_cam_page fe_eyecam_decode(const uint8_t *p_page, int32_t p_size, uint64_t p_now_ns, uint64_t p_max_age_ns);
+fe_eye_out fe_eyecam_apply(const fe_gains *p_g, bool p_heuristics, const fe_eye_out *p_base, const fe_cam_eye *p_cam);
+float fe_eyecam_pupil_cm(const fe_cam_eye *p_cam);
 float fe_clamp01(float p_v);
 float fe_clamp_signed(float p_v);
 fe_calib fe_calib_normalized(const fe_calib *p_c);
